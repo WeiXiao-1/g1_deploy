@@ -4,7 +4,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
-#include <unitree/robot/channel/channel_subscriber.hpp>
+#include <unitree/robot/channel/channel_factory.hpp>
 
 namespace g1_control {
 template<class Message>
@@ -70,20 +70,25 @@ private:
 template<class Message>
 class DdsStateCache {
 public:
-    explicit DdsStateCache(const std::string& topic) : subscriber_(topic) {}
+    explicit DdsStateCache(const std::string& topic) : topic_(topic) {}
     DdsStateCache(const DdsStateCache&) = delete;
     DdsStateCache& operator=(const DdsStateCache&) = delete;
     ~DdsStateCache() { Close(); }
     template<class Validate, class LatchFault>
     void Start(Validate validate, LatchFault latch_fault) {
-        subscriber_.InitChannel([this, validate, latch_fault](const void* message) {
-            cache_.UpdateWithPolicy(*static_cast<const Message*>(message), validate, latch_fault);
-        }, 1);
-        started_ = true;
+        channel_ = unitree::robot::ChannelFactory::Instance()->CreateRecvChannel<Message>(
+            topic_, [this, validate, latch_fault](const void* message) {
+                cache_.UpdateWithPolicy(*static_cast<const Message*>(message), validate, latch_fault);
+            }, 1);
     }
     void Start() { Start([](const Message&) {}, [] { return false; }); }
     void Close() {
-        if (started_) { subscriber_.CloseChannel(); started_ = false; }
+        if (!channel_) return;
+        // Close while this thread still owns the reader, so an in-flight DDS
+        // callback cannot end up destroying its own reader.
+        auto reader = channel_->GetReader()->GetNative();
+        reader.close();
+        channel_.reset();
     }
     auto Read() const { return cache_.Read(); }
     std::string Error() const { return cache_.Error(); }
@@ -92,7 +97,7 @@ public:
     }
 private:
     StateCache<Message> cache_;
-    unitree::robot::ChannelSubscriber<Message> subscriber_;
-    bool started_ = false;
+    std::string topic_;
+    unitree::robot::ChannelPtr<Message> channel_;
 };
 }  // namespace g1_control

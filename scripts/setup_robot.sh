@@ -57,7 +57,7 @@ for process in pathlib.Path('/proc').iterdir():
         executable = pathlib.Path(os.readlink(str(process / 'exe')).removesuffix(' (deleted)') if hasattr(str, 'removesuffix') else os.readlink(str(process / 'exe')).replace(' (deleted)', ''))
     except (OSError, PermissionError):
         continue
-    if executable.name in ('g1_dwaq', 'g1_parkour', 'g1_hybrid') and root in executable.parents:
+    if executable.name in ('g1_dwaq', 'g1_parkour', 'g1_hybrid', 'g1_getup_mimic_real', 'g1_stablemimic_real') and root in executable.parents:
         raise SystemExit('Controller is running (PID {}). Exit it before setup.'.format(process.name))
 PY
 deps="$root/.deps"
@@ -104,6 +104,7 @@ LD_LIBRARY_PATH="$deps/cyclonedds/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$py
 "$python" -m pip freeze > "$deps/setup-logs/python-packages.txt"
 if ((!deps_only)); then
     cmake -S "$root" -B "$root/build" -DCMAKE_BUILD_TYPE=Release \
+        -DG1_GETUP_MIMIC_ONLY=OFF \
         -DG1_REQUIRE_REALSENSE=ON \
         -DCMAKE_PREFIX_PATH="$deps/realsense" \
         -DONNXRUNTIME_ROOT="$deps/onnxruntime" \
@@ -124,7 +125,7 @@ for name in ('g1', 'monitor', 'realsense', 'parkour'):
     path.write_bytes(path.read_bytes().replace(b'\r\n', b'\n'))
     path.chmod(path.stat().st_mode | 0o111)
 PY
-    (cd "$root/install" && ./g1 check && ./g1 parkour check)
+    (cd "$root/install" && ./g1 check && ./g1 parkour check && ./g1 getup-mimic check && ./g1 stablemimic check)
 fi
 if ((verify_camera)); then
     [[ -x "$root/build/g1_camera_check" ]] || { echo 'Build the native camera check before --verify-camera.' >&2; exit 1; }

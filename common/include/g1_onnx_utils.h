@@ -56,11 +56,8 @@ struct InputTensor {
     std::vector<int64_t> shape; // 包含 batch 维度，例如 [1, 480]
 };
 
-// 同步执行：借用输入缓冲区创建张量，返回前将输出复制到独立数组。
-// OutputSize 是策略期望的输出元素数，运行后还会检查类型、数量及有限性。
-template<std::size_t OutputSize>
-std::array<float, OutputSize> Run(Ort::Session& session, const std::vector<InputTensor>& inputs,
-                                   const std::string& output_name) {
+inline std::vector<Ort::Value> RunOutputs(Ort::Session& session, const std::vector<InputTensor>& inputs,
+                                           const std::vector<const char*>& output_names) {
     auto cpu_memory = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
     std::vector<Ort::Value> input_tensors;
     std::vector<const char*> input_names;
@@ -71,22 +68,33 @@ std::array<float, OutputSize> Run(Ort::Session& session, const std::vector<Input
             cpu_memory, input.data, input.size, input.shape.data(), input.shape.size()));
         input_names.push_back(input.name);
     }
-    const char* output_name_pointer = output_name.c_str();
-    auto output_tensors = session.Run(
+    return session.Run(
         Ort::RunOptions{nullptr}, input_names.data(), input_tensors.data(), input_tensors.size(),
-        &output_name_pointer, 1);
-    const auto output_info = output_tensors.front().GetTensorTypeAndShapeInfo();
+        output_names.data(), output_names.size());
+}
+
+template<std::size_t OutputSize>
+std::array<float, OutputSize> ReadOutput(const Ort::Value& tensor) {
+    const auto output_info = tensor.GetTensorTypeAndShapeInfo();
     if (output_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
         output_info.GetElementCount() != OutputSize) {
         throw std::runtime_error("Unexpected ONNX output type/size");
     }
-    const auto* values = output_tensors.front().GetTensorData<float>();
+    const auto* values = tensor.GetTensorData<float>();
     std::array<float, OutputSize> output_values{};
     for (std::size_t i = 0; i < OutputSize; ++i) {
         if (!std::isfinite(values[i])) throw std::runtime_error("Non-finite network output");
         output_values[i] = values[i];
     }
     return output_values;
+}
+
+// 同步执行：借用输入缓冲区创建张量，返回前将输出复制到独立数组。
+// OutputSize 是策略期望的输出元素数，运行后还会检查类型、数量及有限性。
+template<std::size_t OutputSize>
+std::array<float, OutputSize> Run(Ort::Session& session, const std::vector<InputTensor>& inputs,
+                                 const std::string& output_name) {
+    return ReadOutput<OutputSize>(RunOutputs(session, inputs, {output_name.c_str()}).front());
 }
 
 // 单输入网络的便捷入口，复用相同的输出检查。

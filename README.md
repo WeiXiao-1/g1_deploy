@@ -39,6 +39,138 @@ C++控制程序不依赖MuJoCo、ROS或Python；可选网页监控需要Python�
 
 公共参数放在模式后，例如 `./g1 dwaq sim --domain 2`。默认读取各自 JSON 中的模型路径；Parkour 的 `--port` 和自动相机管理按其深度输入需求保留。`./g1 run eth0`、`./g1 check` 等旧命令仍兼容。
 
+### GetUpMimic 离线检查
+
+`./g1 getup-mimic check` 核对 `model_14000.onnx` 的导出样本，并用俯卧和仰卧起步时的状态序列验证 8 帧观测历史、动作反馈和 DDS 关节目标。检查过程只执行 CPU 推理。
+仅构建此入口时需要原生 ONNX Runtime 和 yaml-cpp。
+
+```bash
+cmake -S . -B build -DG1_GETUP_MIMIC_ONLY=ON -DONNXRUNTIME_ROOT=/path/to/native/onnxruntime
+cmake --build build --target g1_getup_mimic
+./g1 getup-mimic check
+```
+
+复用此构建目录编译完整项目时，配置 CMake 时传入 `-DG1_GETUP_MIMIC_ONLY=OFF`。
+
+### GetUpMimic 倒地起身仿真
+
+先构建 `g1_getup_mimic`，再用带 MuJoCo 和 NumPy 的 Python 运行源码目录下的 `sim.py`。
+`--mjcf` 指向训练包中 `code/source/whole_body_tracking/whole_body_tracking/assets/unitree_description/mjcf/g1.xml`，并保留训练包里该文件引用的网格。
+
+```bash
+python3 apps/simulation/sim.py --getup-mimic --mjcf /path/to/g1.xml --headless
+python3 apps/simulation/sim.py --getup-mimic --mjcf /path/to/g1.xml --pose backup --follow
+```
+
+默认验证俯卧（`backup`）和仰卧（`faceup`）各三组固定起姿。可用 `--pose faceup` 或 `--pose backup` 只运行一类。
+仿真每 5 ms 推进一步，每两步运行一次 C++ 策略。每组运行 15 秒，最终需连续至少 1 秒满足骨盆高度大于 0.65 m、直立余弦大于 0.9。
+输出中的 `first stable` 是第一次累计满足 1 秒的时刻，`final stand` 是结束时连续满足判据的时长。任一用例失败时命令退出码为 1。
+
+加 `--interactive` 可以在窗口里演练接管和起身。
+
+```bash
+python3 apps/simulation/sim.py --getup-mimic --mjcf /path/to/g1.xml --pose backup --interactive --follow
+```
+
+将焦点放在 MuJoCo 窗口。机器人起初处于脱力状态，零电机力矩下仍会受重力和接触影响。起姿预设只用于摆放场景。可以双击选中一个部位，再按住 `Ctrl` 用鼠标拖动施力，形成不同的倒地姿态。
+按 `9` 模拟原配遥控器 `Start` 接管，机器人进入纯阻尼待命。随后按 `P`，策略清空历史并直接从当前仿真姿态起身，站稳后继续运行。按空格停止策略并将电机力矩清零，机器人进入脱力状态，物理仍继续推进。再次起身时重新按 `9 → P`。`R` 重置到当前预设，`N` 切换下一个预设，两者都会回到脱力状态。
+
+按 `P` 后，手动模式在最初 180 ms 将纯阻尼力矩平滑过渡到策略的 PD 力矩。第一步仍使用待命阻尼，后续每 10 ms 提高策略力矩权重。策略从第一步起就读取实时姿态并更新历史。
+
+#### 按实机配置仿真
+
+`--hardware-config` 使用同一份 `g1_getup_mimic.json` 和实机控制器的 C++ 力矩计算、限位、起身入口和站稳判据。MuJoCo 每 2 ms 推进一步并更新力矩，ONNX 仍每 10 ms 推理一次。目标角先按关节范围裁剪，随后计算 PD 和裁剪力矩，关节到达限位时屏蔽朝外的力矩。超过实测关节容差或站稳后倾斜过大时触发保护。起身超时则回到阻尼待命。
+
+```bash
+python3 apps/simulation/sim.py --getup-mimic --mjcf /path/to/g1.xml --hardware-config --interactive --follow
+python3 apps/simulation/sim.py --getup-mimic --mjcf /path/to/g1.xml --hardware-config --headless
+```
+
+窗口模式沿用 `9 → P` 和空格。保护触发后先模拟一小段驱动侧阻尼，再进入脱力，按 `R` 或 `N` 重新开始。批量模式先脱力落稳 2 秒，再阻尼待命 0.5 秒，随后从当时的姿态起身。`controller standing` 是实机判据首次成立的时刻，`final stand` 是 MuJoCo 按骨盆高度和直立姿态计算的最终连续站立时长。批量用例要求两项都通过。
+
+此模式在仿真时间中同步运行推理与物理，覆盖可由关节状态和 IMU 姿态决定的保护。DDS 掉包、推理实际耗时超限、驱动响应、温度和电机故障仍需在实机链路上验证。
+
+### GetUpMimic 实机
+
+完整构建包含 `g1_getup_mimic_real`。仅构建 GetUpMimic 时，加 `-DG1_GETUP_MIMIC_REAL=ON` 并提供 Unitree SDK2。
+
+```bash
+cmake -S . -B build -DG1_GETUP_MIMIC_ONLY=ON -DG1_GETUP_MIMIC_REAL=ON -DONNXRUNTIME_ROOT=/path/to/native/onnxruntime
+cmake --build build -j4
+./g1 getup-mimic check
+./g1 getup-mimic read-only eth0
+./g1 getup-mimic real eth0
+```
+
+将 `eth0` 换为与控制板相连的网卡，实机固定使用 DDS 域 0。
+`read-only` 检查 `LowState` 完整性、电机和关节范围，并显示骨盆重力方向与当前姿态是否满足起身入口条件。
+`real` 启动后处于空跑，按 `P` 或遥控器 `X` 可预览策略目标，终端按秒报告推理耗时峰值。空跑目标发布到 `rt/g1/dry_run_target`。
+
+完成机型对应的低层调试准备后，模拟按键对应关系为 `9` / `Start` 接管、`P` / `X` 起身、空格 / `Select` 停止。
+接管要求摇杆回中和静止的俯卧或仰卧姿态。接管完成后先进入阻尼待命，再次按 `P` / `X` 从最新实测姿态启动起身。
+策略周期为 10 ms，机载控制循环按 2 ms 调度。控制器在机载侧计算 PD 并将裁剪后的总力矩放入 `LowCmd.tau`，位置增益和速度增益字段置零，渐入时长为 180 ms。
+关节限位和力矩上限按 DDS 电机顺序配置。目标角按限位夹紧，实测超过限位及其容差时会停止。站立阶段以骨盆姿态、角速度和膝关节状态连续满足 1 秒为判据。起身 15 秒未达到判据时退回阻尼待命。
+
+手动停止会停止策略、发送零力矩命令并退出。状态失效、推理超时或电机异常时使用驱动侧阻尼退出。检测到竞争发布者时释放本程序的发送端。
+这些是软件控制行为。首次实机验收需核对对应机型的关节范围、力矩字段行为和停止响应，并按该机的低层开发文档开展有现场保护的试验。
+
+### StableMimic 离线检查和 MuJoCo 回放
+
+完整版包含 `g1_stablemimic`。在 GetUpMimic 单独构建目录启用 StableMimic 时，重新配置 CMake 并传入 `-DG1_STABLEMIMIC=ON`。
+
+```bash
+cmake --build build --target g1_stablemimic
+./g1 stablemimic check
+```
+
+离线检查使用随项目提供的 `model_34500.onnx`，核对跟踪、俯卧和仰卧三个片段中四帧历史、动作、Gate 权重及 DDS 目标角。策略周期为 20 ms。离线检查和仿真均读取 StableMimic 自己的 `apps/stablemimic/config/g1_stablemimic.json`，也可传入 `--config`。模型和对拍文件的相对路径以配置所在目录为基准，站立参考和倒地库的相对路径以 `--stablemimic-root` 为基准。
+
+用安装了 MuJoCo、NumPy 和 ONNX Runtime 的 Python 运行下面的命令，并将 `--stablemimic-root` 指向训练项目。回放由 C++ 推理提供动作，物理步进和参考动作由 StableMimic 的 Python 播放器执行，终端给出两端的逐帧最大误差。
+
+```bash
+python apps/simulation/stablemimic_sim.py --stablemimic-root /path/to/stablemimic --library backup --viewer
+python apps/simulation/stablemimic_sim.py --stablemimic-root /path/to/stablemimic --motion-file /path/to/dance1_subject1.npz --viewer
+python apps/simulation/stablemimic_sim.py --stablemimic-root /path/to/stablemimic \
+  --library backup --motion-file /path/to/dance1_subject1.npz --viewer
+```
+
+`--library backup` 或 `--library faceup` 从倒地库所选行摆放。单独传入 `--library` 时使用固定站立参考，单独传入 `--motion-file` 时从参考姿态摆放。两项同时传入时，从倒地姿态开始，舞蹈参考从策略启动起每 20 ms 前进一帧。恢复到直立后，沿用 StableMimic 播放器做水平位置重对齐，再跟踪当时的参考帧。用 `--pose-index` 选择从 0 开始的倒地库行号，用 `--start-frame` 选择动作参考起点。可加 `--trace` 指定新的 JSONL 文件，记录参考帧、两个 Gate 权重、重对齐事件和跟踪误差。
+
+窗口打开时机器人脱力，重力和地面接触持续生效。点击 MuJoCo 窗口，按 `9` 接管并进入阻尼待命，再按 `P` 清空观测历史、从当前姿态启动策略。策略力矩按独立配置渐入，默认 180 ms。按空格立即清零电机力矩并回到脱力状态，可再次按 `9 → P`。省略 `--viewer` 会自动开始离屏对拍。
+
+### StableMimic 实机
+
+完整构建包含 `g1_stablemimic_real`。仅构建这两个独立控制器时，在原有 SDK2 和 ONNX Runtime 配置上设置 `-DG1_GETUP_MIMIC_ONLY=ON -DG1_GETUP_MIMIC_REAL=ON -DG1_STABLEMIMIC=ON`。
+
+```bash
+cmake --build build --target g1_stablemimic_real
+./g1 stablemimic read-only eth0
+./g1 stablemimic real eth0
+```
+
+将 `eth0` 换为机器人网卡。控制器从 G1 `rt/lowstate` 读取关节和 IMU，同时要求独立的骨盆里程计。Unitree 说明内置运动服务关闭后，实机的 `SportModeState` 会停止提供。控制器分别在接管前和释放运动服务后检查独立数据源。 [Unitree SDK 仿真说明](https://github.com/unitreerobotics/unitree_mujoco#supported-unitree-sdk2-messages)
+
+如果已有 ROS 2 骨盆里程计，可在装有 ROS 2 和 `unitree_sdk2py` 的环境里启动下列桥接程序，将 `/pelvis/odom` 换成实际话题名。估计器和控制器时钟应同步，里程计应持续覆盖站立、倒地和起身，建议至少 50 Hz。默认 `header.frame_id=odom`、`child_frame_id=pelvis`，要求世界系 Z 轴朝上、地面为 `z=0`，并以舞蹈所需方向标定世界系航向。ROS 里程计的 pose 以世界系表示，twist 以骨盆系表示。传感器在其他位置时，估计器需先通过外参将姿态、位置和速度换算到 `pelvis` 连杆原点。 [ROS 2 Odometry 消息定义](https://github.com/ros2/common_interfaces/blob/rolling/nav_msgs/msg/Odometry.msg)
+
+```bash
+python3 apps/stablemimic/scripts/odometry_bridge.py eth0 --odom /pelvis/odom
+```
+
+直接对接 DDS 时，在域 0 发布 `unitree_go::msg::dds_::SportModeState_` 到 `rt/stablemimic/base_state`。填入估计采样的 Unix 时间戳 `stamp`、世界系骨盆原点位置 `position`（m）、骨盆原点世界系速度 `velocity`（m/s）、骨盆到世界的 `imu_state.quaternion`（wxyz）和 `error_code`（0 表示有效）。控制器把速度移到骨盆连杆质心，并用实测腰部关节和训练模型的几何关系计算躯干参考点。只读命令显示实测骨盆高度和速度，可核对站立与倒地读数。桥接程序负责转发已有估计，实际定位由用户接入的估计器提供。
+
+`real` 启动为空跑，`P` / `X` 可以预览。按 `9` / `Start` 接管后只输出阻尼，摇杆需回中且机器人需静止。再次按 `P` / `X` 从实测姿态开始推理，默认 180 ms 渐入力矩。按空格 / `Select` 清零电机力矩并退出。状态过期、估计跳变或推理超时会停止策略，电机反馈仍有效时发限幅阻尼，反馈无效时发零力矩。检测到竞争发布者时关闭本程序的发送端。
+
+策略每 20 ms 推理，2 ms 低层循环对 29 路电机计算 PD 力矩。实机关节范围、速度和力矩上限在 StableMimic 的 `hardware` 配置内，速度和力矩取硬件配置与模型元数据的较小值。此配置的初值来自 G1 29DOF 描述，腰部 roll 和 pitch 为 ±0.52 rad。上机前按具体机型核对这些值。 [Unitree G1 29DOF URDF](https://github.com/unitreerobotics/unitree_rl_gym/blob/main/resources/robots/g1_description/g1_29dof.urdf)
+
+实机默认用随安装包提供的固定站立参考。舞蹈可在开发机用装有 NumPy 的 Python 将已有 50 Hz NPZ 转换后复制到机载端，`--start-frame` 默认为 0。
+
+```bash
+python3 apps/stablemimic/scripts/export_reference.py /path/to/dance1_subject1.npz /tmp/dance1.txt
+./g1 stablemimic real eth0 --motion /tmp/dance1.txt --start-frame 0
+```
+
+舞蹈从策略启动起每 20 ms 前进一帧。起身和跟踪由模型的 Gate 选择，恢复直立后对齐当时的舞蹈帧的水平位置。舞蹈播完后用同一策略跟踪站立参考。
+
 ### DreamWaQ：检查、空跑与行走
 
 ```bash

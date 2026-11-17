@@ -3,10 +3,11 @@
 set -euo pipefail
 package_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "$package_dir/CMakeLists.txt" ]]; then
-    controller="$package_dir/build/g1_dwaq"
+    bin_dir="$package_dir/build"
 else
-    controller="$package_dir/bin/g1_dwaq"
+    bin_dir="$package_dir/bin"
 fi
+controller="$bin_dir/g1_dwaq"
 config="$package_dir/apps/dwaq/config/g1_locomotion.json"
 usage() {
     cat <<'HELP'
@@ -16,6 +17,12 @@ Usage:
   ./g1 dwaq|parkour|hybrid real ROBOT_INTERFACE [options]
                                     Hardware control, Unitree remote by default
   ./g1 dwaq|parkour|hybrid help             Show usage
+  ./g1 getup-mimic check [--config JSON]     Offline GetUpMimic model and target checks
+  ./g1 getup-mimic read-only INTERFACE     Inspect GetUpMimic hardware state
+  ./g1 getup-mimic real INTERFACE          GetUpMimic hardware control, starts in dry run
+  ./g1 stablemimic check [--config JSON]   Offline StableMimic reference parity checks
+  ./g1 stablemimic read-only INTERFACE     Inspect G1 and StableMimic base estimate
+  ./g1 stablemimic real INTERFACE          StableMimic hardware control, starts in dry run
 
 Options: --config JSON; sim also accepts --domain 1 --interface lo.
 Model paths, reset_seconds and hardware limits are configured in each program's JSON.
@@ -52,6 +59,60 @@ if [[ "$mode" == interfaces ]]; then
     exit 0
 fi
 export LD_LIBRARY_PATH="$package_dir/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+if [[ "$mode" == stablemimic ]]; then
+    stablemimic_mode="${1:-help}"
+    stablemimic_usage() {
+        printf '%s\n' 'Usage: ./g1 stablemimic check [--config JSON] [--model ONNX] [--fixture JSON]' \
+            '       ./g1 stablemimic read-only INTERFACE [--config JSON]' \
+            '       ./g1 stablemimic real INTERFACE [--config JSON] [--motion REFERENCE.txt] [--start-frame INDEX]'
+    }
+    case "$stablemimic_mode" in
+        check)
+            shift
+            controller="$bin_dir/g1_stablemimic"
+            [[ -x "$controller" ]] || { echo 'Build g1_stablemimic first (G1_STABLEMIMIC=ON in a GetUpMimic-only build).' >&2; exit 1; }
+            exec "$controller" check --config "$package_dir/apps/stablemimic/config/g1_stablemimic.json" "$@"
+            ;;
+        read-only|real)
+            shift
+            (($# >= 1)) || { stablemimic_usage >&2; exit 2; }
+            robot_interface="$1"; shift
+            controller="$bin_dir/g1_stablemimic_real"
+            [[ -x "$controller" ]] || { echo 'Build StableMimic with Unitree SDK2 (G1_STABLEMIMIC=ON and G1_GETUP_MIMIC_REAL=ON in a standalone build).' >&2; exit 1; }
+            exec "$controller" "$stablemimic_mode" "$robot_interface" --config "$package_dir/apps/stablemimic/config/g1_stablemimic.json" "$@"
+            ;;
+        help|--help) stablemimic_usage; exit 0 ;;
+        *) stablemimic_usage >&2; exit 2 ;;
+    esac
+fi
+if [[ "$mode" == getup-mimic ]]; then
+    getup_mode="${1:-help}"
+    getup_usage() {
+        printf '%s\n' 'Usage: ./g1 getup-mimic check [--config JSON]' \
+            '       ./g1 getup-mimic read-only|real INTERFACE [--config JSON]'
+    }
+    case "$getup_mode" in
+        help|--help)
+            getup_usage
+            exit 0
+            ;;
+        check)
+            shift
+            controller="$bin_dir/g1_getup_mimic"
+            [[ -x "$controller" ]] || { echo "Missing executable: $controller" >&2; exit 1; }
+            exec "$controller" check --config "$package_dir/apps/getup_mimic/config/g1_getup_mimic.json" "$@"
+            ;;
+        read-only|real)
+            shift
+            (($# >= 1)) || { getup_usage >&2; exit 2; }
+            robot_interface="$1"; shift
+            controller="$bin_dir/g1_getup_mimic_real"
+            [[ -x "$controller" ]] || { echo 'Build GetUpMimic with Unitree SDK2 (G1_GETUP_MIMIC_REAL=ON in a standalone build).' >&2; exit 1; }
+            exec "$controller" "$getup_mode" "$robot_interface" --config "$package_dir/apps/getup_mimic/config/g1_getup_mimic.json" "$@"
+            ;;
+        *) getup_usage >&2; exit 2 ;;
+    esac
+fi
 if [[ "$mode" == monitor ]]; then
     if [[ -x "$package_dir/monitor" ]]; then exec "$package_dir/monitor" "$@"; fi
     exec bash "$package_dir/apps/monitor/monitor.sh" "$@"

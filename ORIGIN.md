@@ -41,3 +41,37 @@ The DreamWaQ deployment configuration is serialized as JSON.
 Parkour maintains its own `hardware` section in `apps/parkour/config/g1_parkour.json`; hardware settings are no longer shared between programs.
 
 Model paths are configured in each program's JSON, relative to the configuration directory.
+
+GetUpMimic model: `apps/getup_mimic/models/model_14000.onnx`
+SHA256: `7546832b6cffe450c997daaa3d25992f47ea4081ca23bd94392c2440d7f9a5c5`
+
+This is a byte-for-byte copy of `exported/model_14000.onnx` from the local
+`getup-mimic/motion_data/expert_ppo/canonical_tree_v1_no_inner_hands_3to1_v1` bundle.
+Joint names come from `database.npz`. Nominal joint angles, action scales and
+PD gains come from `original_training/params/env.yaml` in the same bundle.
+The check fixture includes the three pairs from `exported/model_14000.parity.npz`
+and the first ten 10 ms observations and targets from MuJoCo rollouts starting
+at database rows 0 (`backup`) and 3481 (`faceup`), using the bundle's MJCF and PD parameters.
+
+The GetUpMimic simulation uses rows 0, 1740 and 3480 (`backup`), and 3481, 12531
+and 21580 (`faceup`) from the same database. `g1_getup_mimic_sim.json` stores
+their initial root and joint poses together with the physics step, armatures
+and effort limits resolved from `original_training/params/env.yaml`.
+
+The GetUpMimic hardware position bounds use the DDS joint order and the
+[Unitree 29-DOF G1 URDF](https://github.com/unitreerobotics/unitree_rl_gym/blob/main/resources/robots/g1_description/g1_29dof.urdf).
+The hip-yaw limits (±2.7576 rad) also match the training MJCF.
+The nominal torque caps are the lower of the URDF effort limit and the
+corresponding training effort limit. URDF SHA256
+`f055210bb33df3513a639573c6886ebd18f52fc70b507ef18930b51efb82cf2e`.
+
+StableMimic model `apps/stablemimic/models/model_34500.onnx`
+has SHA256 `774139512ab9ea362b7c2be3daa7e241166aaf28d6139ef15230bad963a72e4a`.
+It is a byte-for-byte copy of `exported/model_34500.onnx` from the local StableMimic
+run `2026-11-13_10-47-45_346170_assist`. Its `stablemimic.mujoco.v1` metadata
+supplies joint order, nominal positions, action scale and clipping, and drive parameters.
+
+`apps/stablemimic/checks/model_34500.json` records 12 consecutive 20 ms steps
+from the upstream Python player in each of three sequences. Tracking starts at
+frame 80 of `dance1_subject1.npz`. Recovery uses row 0 of the `backup` and
+`faceup` pose libraries with the player's fixed `standing-command.npz`.

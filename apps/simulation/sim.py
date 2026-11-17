@@ -1,8 +1,7 @@
-"""Start the shared G1 29DOF MuJoCo environment for DWaQ or Parkour.
+"""Run the G1 MuJoCo environment or the standalone GetUpMimic recovery cases.
 
-Both controllers use DDS on lo. Depth observations are enabled by default so
-Parkour can use the same environment; --no-depth selects DDS-only simulation.
-The physics engine, scene and dependencies remain in unitree_mujoco.
+The shared environment uses unitree_mujoco and DDS on lo. GetUpMimic uses
+the training bundle's MJCF and steps its C++ policy in simulation time.
 """
 import argparse
 from contextlib import ExitStack
@@ -18,7 +17,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mujoco-root", type=Path, required=True)
+    parser.add_argument("--mujoco-root", type=Path, help="External unitree_mujoco checkout for the DDS environment")
+    getup = parser.add_argument_group("GetUpMimic")
+    getup.add_argument("--getup-mimic", action="store_true", help="Run fixed fallen-pose recovery cases")
+    getup.add_argument("--mjcf", type=Path, help="Path to g1.xml from the GetUpMimic training bundle")
+    getup.add_argument("--pose", choices=("all", "backup", "faceup"), help="Recovery cases to run (default: all)")
+    getup.add_argument("--headless", action="store_true", help="Run GetUpMimic without opening the viewer")
+    getup.add_argument("--interactive", action="store_true", help="Use 9 to take over, P to get up and Space to stop")
+    getup.add_argument("--hardware-config", action="store_true",
+                       help="Use the real GetUpMimic control period and motion protections in MuJoCo")
     parser.add_argument("--domain", type=int, default=1)
     parser.add_argument("--depth", action=argparse.BooleanOptionalAction, default=True,
                         help="Publish Parkour depth observations (DWaQ ignores them)")
@@ -32,6 +39,30 @@ def main():
     parser.add_argument("--window-backend", choices=("auto", "x11", "wayland"), default="x11",
                         help="Window backend (default: x11); auto prefers X11/XWayland when DISPLAY is available")
     args = parser.parse_args()
+    if args.getup_mimic:
+        if args.mjcf is None or args.mujoco_root is not None:
+            parser.error("--getup-mimic requires --mjcf and runs independently of --mujoco-root")
+        if args.domain != 1 or args.terrain != "original" or args.depth_preview:
+            parser.error("DDS domain, terrain generation and depth preview require --mujoco-root")
+        if args.interactive and args.headless:
+            parser.error("--interactive requires the MuJoCo viewer")
+        try:
+            if not args.headless:
+                select_window_backend(args.window_backend)
+            from getup_mimic_sim import run
+
+            return run(PROJECT_ROOT, args.mjcf, args.pose or "all", args.headless, args.follow,
+                       args.interactive, args.hardware_config)
+        except ModuleNotFoundError as error:
+            parser.exit(1, f"GetUpMimic requires a Python environment with MuJoCo and NumPy: {error}\n")
+        except (KeyError, OSError, RuntimeError, ValueError) as error:
+            parser.exit(1, f"GetUpMimic: {error}\n")
+        except KeyboardInterrupt:
+            parser.exit(130, "GetUpMimic interrupted\n")
+    if args.mjcf is not None or args.pose is not None or args.headless or args.interactive or args.hardware_config:
+        parser.error("--mjcf, --pose, --headless, --interactive and --hardware-config require --getup-mimic")
+    if args.mujoco_root is None:
+        parser.error("--mujoco-root is required for the DDS environment")
     if args.domain <= 0:
         parser.error("Use a positive simulation domain")
     if args.depth_preview and not args.depth:
@@ -48,12 +79,7 @@ def main():
 
     previous_path, previous_argv = sys.path[:], sys.argv
     previous_backend = os.environ.get("PYGLFW_LIBRARY_VARIANT")
-    window_backend = args.window_backend
-    if window_backend == "auto":
-        window_backend = previous_backend or ("x11" if sys.platform == "linux" and os.environ.get("DISPLAY") else "auto")
-    # Select the GLFW wheel library before importing the simulator or camera bridge.
-    if window_backend != "auto":
-        os.environ["PYGLFW_LIBRARY_VARIANT"] = window_backend
+    window_backend = select_window_backend(args.window_backend)
     bridge = original_publisher = None
     temporary_scene = None
     try:
@@ -111,5 +137,16 @@ def main():
             temporary_scene.cleanup()
 
 
+def select_window_backend(backend):
+    if backend == "auto":
+        backend = os.environ.get("PYGLFW_LIBRARY_VARIANT") or (
+            "x11" if sys.platform == "linux" and os.environ.get("DISPLAY") else "auto"
+        )
+    # Select the GLFW wheel library before importing the simulator or viewer.
+    if backend != "auto":
+        os.environ["PYGLFW_LIBRARY_VARIANT"] = backend
+    return backend
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

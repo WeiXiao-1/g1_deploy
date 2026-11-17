@@ -1,5 +1,16 @@
 """Configure the external simulator's viewer without changing its scene files."""
 from contextlib import contextmanager
+import time
+
+
+def close_viewer(viewer):
+    viewer.close()
+    deadline = time.monotonic() + 5
+    # The passive viewer can report stopped before its render thread releases GLFW.
+    while viewer.m is not None:
+        if time.monotonic() >= deadline:
+            raise RuntimeError("MuJoCo viewer did not release its model after closing")
+        time.sleep(0.01)
 
 
 @contextmanager
