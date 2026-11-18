@@ -1,3 +1,4 @@
+#include "g1_stablemimic_control.h"
 #include "g1_stablemimic_reference.h"
 
 #include "g1_async_log.h"
@@ -7,7 +8,6 @@
 #include "g1_control_targets.h"
 #include "g1_dds_state_cache.h"
 #include "g1_hardware.h"
-#include "g1_joint_mapping.h"
 #include "g1_keyboard.h"
 #include "g1_loop_scheduler.h"
 #include "g1_monitor_publisher.h"
@@ -37,42 +37,6 @@ using Receiver = g1_control::DdsStateCache<LowState>;
 using BaseReceiver = g1_control::DdsStateCache<BaseState>;
 using Snapshot = g1_control::StateCache<LowState>::Snapshot;
 
-double PositiveSetting(const YAML::Node& node, const char* name, double maximum) {
-    const auto value = node[name].as<double>();
-    if (!std::isfinite(value) || value <= 0 || value > maximum)
-        throw std::runtime_error(std::string("Invalid StableMimic hardware setting: ") + name);
-    return value;
-}
-
-struct Settings {
-    g1_hardware::LimitsConfig limits;
-    std::string base_topic, standing_reference;
-    double estimate_timeout, max_skew, ramp_seconds, position_tolerance;
-    double entry_joint_speed, entry_pelvis_speed, entry_gyro;
-    Joints effort, velocity;
-
-    explicit Settings(const YAML::Node& root) : limits(root, false) {
-        const auto hw = root["hardware"];
-        base_topic = hw["base_state_topic"].as<std::string>();
-        standing_reference = hw["standing_reference"].as<std::string>();
-        if (base_topic.empty() || base_topic == "rt/sportmodestate" || base_topic == "rt/odommodestate" ||
-            standing_reference.empty())
-            throw std::runtime_error("Configure an independent base state topic and a standing reference");
-        estimate_timeout = PositiveSetting(hw, "estimate_timeout_ms", 150);
-        max_skew = PositiveSetting(hw, "max_state_skew_ms", estimate_timeout);
-        ramp_seconds = PositiveSetting(hw, "ramp_seconds", 5);
-        position_tolerance = PositiveSetting(hw, "position_tolerance_rad", .10);
-        entry_joint_speed = PositiveSetting(hw, "entry_max_joint_speed_rad_s", 5);
-        entry_pelvis_speed = PositiveSetting(hw, "entry_max_pelvis_speed_m_s", 2);
-        entry_gyro = PositiveSetting(hw, "entry_max_gyro_rad_s", 3);
-        effort = g1_config::ReadArray<double, kJointCount>(hw["effort_limit"]);
-        velocity = g1_config::ReadArray<double, kJointCount>(hw["velocity_limit"]);
-        for (int i = 0; i < kJointCount; ++i)
-            if (effort[i] <= 0 || velocity[i] <= 0)
-                throw std::runtime_error("Joint effort and speed limits must be positive");
-    }
-};
-
 template<std::size_t N, class T>
 std::array<double, N> AsDoubles(const std::array<T, N>& array) {
     std::array<double, N> result{};
@@ -82,15 +46,18 @@ std::array<double, N> AsDoubles(const std::array<T, N>& array) {
 
 double Norm(const Vector3& a) { return std::hypot(a[0], a[1], a[2]); }
 
-void CheckMotorState(const Settings& settings, const LowState& state) {
-    g1_hardware::CheckMotorHealth(state, settings.limits.temperature);
+State ReadJoints(const LowState& low) {
+    State state;
     for (int joint = 0; joint < kJointCount; ++joint) {
-        const double q = state.motor_state()[joint].q();
-        if (q < settings.limits.lower[joint] - settings.position_tolerance ||
-            q > settings.limits.upper[joint] + settings.position_tolerance)
-            throw std::runtime_error("Measured joint outside limits: " + g1_joints::kDdsNames[joint] +
-                                     " at " + std::to_string(q) + " rad");
+        state.position[joint] = low.motor_state()[joint].q();
+        state.velocity[joint] = low.motor_state()[joint].dq();
     }
+    return state;
+}
+
+void CheckMotorState(const HardwareSettings& settings, const LowState& state) {
+    g1_hardware::CheckMotorHealth(state, settings.limits.temperature);
+    CheckMeasuredPositions(settings, ReadJoints(state).position);
 }
 
 struct ObservedState {
@@ -100,12 +67,8 @@ struct ObservedState {
 };
 
 ObservedState AssembleState(const LowState& low, const BaseState& estimate, std::uint64_t sequence) {
-    ObservedState result{{}, AsDoubles(estimate.position()), sequence};
+    ObservedState result{ReadJoints(low), AsDoubles(estimate.position()), sequence};
     auto& state = result.state;
-    for (int joint = 0; joint < kJointCount; ++joint) {
-        state.position[joint] = low.motor_state()[joint].q();
-        state.velocity[joint] = low.motor_state()[joint].dq();
-    }
     state.pelvis_rotation = FromQuaternion(AsDoubles(estimate.imu_state().quaternion()));
     const auto low_rotation = FromQuaternion(AsDoubles(low.imu_state().quaternion()));
     // Gravity direction is independent of the odometer's world yaw.
@@ -155,7 +118,7 @@ void StartBaseReceiver(BaseReceiver& receiver, const std::atomic<bool>& armed) {
     }, [&armed] { return armed.load(); });
 }
 
-void StartLowReceiver(Receiver& receiver, const Settings& settings, bool read_only,
+void StartLowReceiver(Receiver& receiver, const HardwareSettings& settings, bool read_only,
                       const std::atomic<bool>& armed, std::atomic<bool>& remote_stop) {
     receiver.Start([&, read_only](const LowState& state) {
         if (armed || read_only) CheckMotorState(settings, state);
@@ -164,14 +127,14 @@ void StartLowReceiver(Receiver& receiver, const Settings& settings, bool read_on
     }, [&, read_only] { return armed || read_only; });
 }
 
-Snapshot ReadLow(const Receiver& receiver, const Settings& settings) {
+Snapshot ReadLow(const Receiver& receiver, const HardwareSettings& settings) {
     const auto low = receiver.Read();
     if (!low.valid || low.AgeMs(Clock::now()) > settings.limits.timeout_ms)
         throw std::runtime_error("LowState stale or invalid. " + low.error);
     return low;
 }
 
-ObservedState ReadPair(const Snapshot& low, const BaseReceiver& receiver, const Settings& settings,
+ObservedState ReadPair(const Snapshot& low, const BaseReceiver& receiver, const HardwareSettings& settings,
                        Clock::time_point after = {}, std::chrono::system_clock::time_point sampled_after = {}) {
     const auto base = receiver.Read();
     const auto& stamp = base.value.stamp();
@@ -188,42 +151,22 @@ ObservedState ReadPair(const Snapshot& low, const BaseReceiver& receiver, const 
     return AssembleState(low.value, base.value, sequence);
 }
 
-bool Resting(const Settings& settings, const ObservedState& observed) {
-    const auto& state = observed.state;
-    return Norm(state.pelvis_angular_velocity_world) <= settings.entry_gyro &&
-           Norm(state.pelvis_linear_velocity_world) <= settings.entry_pelvis_speed &&
-           std::all_of(state.velocity.begin(), state.velocity.end(),
-                       [&](double dq) { return std::abs(dq) <= settings.entry_joint_speed; });
-}
-
 struct Commands { LowCmd motors, monitor; };
 
-Commands BuildCommands(const Settings& settings, const DriveParameters& drive, const LowState& state,
+Commands BuildCommands(const HardwareSettings& settings, const DriveParameters& drive, const LowState& state,
                        const Joints* target, double weight) {
     Commands commands{};
     commands.motors.mode_machine() = commands.monitor.mode_machine() = state.mode_machine();
+    const auto actuation = ComputeActuation(settings, drive, ReadJoints(state), target, weight);
     for (int i = 0; i < kJointCount; ++i) {
-        const double q = state.motor_state()[i].q(), dq = state.motor_state()[i].dq();
-        const double low = settings.limits.lower[i], high = settings.limits.upper[i];
-        const double goal = std::clamp(target ? (*target)[i] : q, low, high);
-        const double kp = target ? weight * drive.kp[i] : 0.;
-        const double kd = settings.limits.stop_kd + weight * (drive.kd[i] - settings.limits.stop_kd);
-        double torque = kp * (goal - q) - kd * dq;
-        if (!std::isfinite(torque)) throw std::runtime_error("Invalid StableMimic motor torque");
-        // Permit braking at the position or speed boundary.
-        const double speed = std::min(settings.velocity[i], drive.velocity_limit[i]);
-        if ((torque < 0 && (q <= low || dq <= -speed)) ||
-            (torque > 0 && (q >= high || dq >= speed))) torque = 0;
-        const double effort = std::min(settings.effort[i], drive.effort_limit[i]);
-
         auto& motor = commands.motors.motor_cmd()[i];
         motor.mode() = 1;
-        motor.q() = static_cast<float>(goal);
-        motor.tau() = static_cast<float>(std::clamp(torque, -effort, effort));
+        motor.q() = actuation.position[i];
+        motor.tau() = actuation.torque[i];
         auto& monitor = commands.monitor.motor_cmd()[i];
         monitor = motor;
-        monitor.kp() = static_cast<float>(kp);
-        monitor.kd() = static_cast<float>(kd);
+        monitor.kp() = actuation.kp[i];
+        monitor.kd() = actuation.kd[i];
         monitor.tau() = 0;
     }
     g1_hardware::CheckCommand(commands.motors);
@@ -242,7 +185,7 @@ class Controller {
     using Worker = g1_inference::PolicyWorker<ObservedState, Inference>;
 
 public:
-    Controller(const Settings& settings, const Receiver& low, const BaseReceiver& base, Policy& policy,
+    Controller(const HardwareSettings& settings, const Receiver& low, const BaseReceiver& base, Policy& policy,
                Playback& playback, std::atomic<bool>& armed, const std::atomic<bool>& remote_stop)
         : settings_(settings), low_(low), base_(base), drive_(policy.Drive()), armed_(armed),
           remote_stop_(remote_stop), worker_(
@@ -305,7 +248,7 @@ private:
     bool Stopped() const { return g1_control::StopRequested() || remote_stop_; }
 
     bool EntryReady(const ObservedState& state) const {
-        return g1_control::InputReady(&remote_.state) && Resting(settings_, state);
+        return g1_control::InputReady(&remote_.state) && Resting(settings_, state.state);
     }
 
     void TakeOver(const Snapshot& low) {
@@ -343,7 +286,7 @@ private:
                 try {
                     CheckMotorState(settings_, fresh.value);
                     const auto observed = ReadPair(fresh, base_, settings_, released, released_wall_time);
-                    if (!Resting(settings_, observed))
+                    if (!Resting(settings_, observed.state))
                         throw std::runtime_error("Robot moved during takeover");
                     remote_ = g1_unitree_remote::Input{};
                     remote_.Update(fresh.value.wireless_remote());  // Discard queued X.
@@ -395,7 +338,7 @@ private:
         if (latest) {
             if (!ramp_started_) ramp_started_ = now;
             const double elapsed = std::chrono::duration<double>(now - *ramp_started_).count();
-            weight = g1_control::InterpolateReset(0.f, 1.f, g1_control::ResetProgress(elapsed, settings_.ramp_seconds));
+            weight = RampWeight(settings_, elapsed);
             Report(*latest, now);
         }
         const auto commands = BuildCommands(settings_, drive_, low.value,
@@ -454,7 +397,7 @@ private:
         if (!written && !monitor_->Conflict()) throw std::runtime_error("No stop command could be published");
     }
 
-    const Settings& settings_;
+    const HardwareSettings& settings_;
     const Receiver& low_;
     const BaseReceiver& base_;
     const DriveParameters& drive_;
@@ -475,7 +418,7 @@ private:
 };
 
 std::optional<std::pair<Snapshot, ObservedState>> WaitForInputs(
-    const Receiver& low, const BaseReceiver& base, const Settings& settings) {
+    const Receiver& low, const BaseReceiver& base, const HardwareSettings& settings) {
     const auto end = Clock::now() + g1_control::kStartupTimeout;
     std::string reason;
     while (!g1_control::StopRequested() && Clock::now() < end) {
@@ -519,7 +462,7 @@ int main(int argc, char** argv) {
         if (start_frame < 0) throw std::invalid_argument("Start frame must be nonnegative");
 
         const auto root = YAML::LoadFile(options.config);
-        const Settings settings(root);
+        const HardwareSettings settings(root);
         g1_control::InstallSignalHandlers();
         unitree::robot::ChannelFactory::Instance()->Init(options.domain, options.interface);
         std::atomic<bool> armed{false}, remote_stop{false};
@@ -535,15 +478,12 @@ int main(int argc, char** argv) {
             const auto& v = state.state.pelvis_linear_velocity_world;
             std::cout << "StableMimic read-only OK | pelvis world xyz [" << p[0] << ", " << p[1] << ", " << p[2]
                       << "] m | pelvis COM velocity [" << v[0] << ", " << v[1] << ", " << v[2]
-                      << "] m/s | resting: " << (Resting(settings, state) ? "yes" : "no") << '\n';
+                      << "] m/s | resting: " << (Resting(settings, state.state) ? "yes" : "no") << '\n';
             return 0;
         }
 
-        const auto standing = LoadReference(g1_config::ResolvePath(options.config, settings.standing_reference));
-        if (standing.size() != 1 || !std::all_of(standing.front().command.velocity.begin(),
-                standing.front().command.velocity.end(), [](double dq) { return std::abs(dq) <= 1e-6; }))
-            throw std::runtime_error("Standing reference must be one frame with zero joint velocities");
-        Playback playback(standing.front(), motion_path.empty() ? std::vector<ReferenceFrame>{} :
+        Playback playback(LoadStandingReference(g1_config::ResolvePath(options.config, settings.standing_reference)),
+                          motion_path.empty() ? std::vector<ReferenceFrame>{} :
                           LoadReference(motion_path), static_cast<std::size_t>(start_frame));
         Policy policy(g1_config::ResolvePath(options.config, root["policy_path"].as<std::string>()));
         policy.Step(state.state, playback.Step(state.state, state.pelvis_position).command);  // Warm up without LowCmd.

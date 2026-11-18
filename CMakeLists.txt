@@ -49,7 +49,8 @@ option(G1_GETUP_MIMIC_ONLY "Build only the standalone GetUpMimic controller" OFF
 option(G1_GETUP_MIMIC_REAL "Include Unitree DDS hardware support in a GetUpMimic-only build" OFF)
 option(G1_STABLEMIMIC "Include StableMimic in a GetUpMimic-only build" OFF)
 if(NOT G1_GETUP_MIMIC_ONLY OR G1_STABLEMIMIC)
-    add_executable(g1_stablemimic apps/stablemimic/src/main.cpp apps/stablemimic/src/policy.cpp)
+    set(STABLEMIMIC_SOURCES apps/stablemimic/src/control.cpp apps/stablemimic/src/policy.cpp apps/stablemimic/src/reference.cpp)
+    add_executable(g1_stablemimic apps/stablemimic/src/main.cpp ${STABLEMIMIC_SOURCES})
     target_include_directories(g1_stablemimic PRIVATE apps/stablemimic/include "${COMMON_INCLUDE}" "${ORT_INCLUDE}")
     target_link_libraries(g1_stablemimic PRIVATE ${GETUP_YAML_TARGET} "${ORT_LIBRARY}")
     target_compile_definitions(g1_stablemimic PRIVATE
@@ -86,7 +87,7 @@ if(UNIX AND NOT APPLE)
 endif()
 install(TARGETS g1_getup_mimic_real RUNTIME DESTINATION bin)
 if(TARGET g1_stablemimic)
-    add_executable(g1_stablemimic_real apps/stablemimic/src/real.cpp apps/stablemimic/src/reference.cpp apps/stablemimic/src/policy.cpp)
+    add_executable(g1_stablemimic_real apps/stablemimic/src/real.cpp ${STABLEMIMIC_SOURCES})
     target_include_directories(g1_stablemimic_real PRIVATE apps/stablemimic/include "${COMMON_INCLUDE}" "${ORT_INCLUDE}")
     target_link_libraries(g1_stablemimic_real PRIVATE unitree_sdk2 ${GETUP_YAML_TARGET} "${ORT_LIBRARY}" Threads::Threads)
     target_compile_definitions(g1_stablemimic_real PRIVATE
@@ -97,6 +98,8 @@ if(TARGET g1_stablemimic)
     endif()
     install(TARGETS g1_stablemimic_real RUNTIME DESTINATION bin)
     install(FILES apps/stablemimic/references/standing.txt DESTINATION apps/stablemimic/references)
+    install(DIRECTORY apps/stablemimic/references/dance/ DESTINATION apps/stablemimic/references/dance
+        FILES_MATCHING PATTERN "*.txt")
     install(FILES apps/stablemimic/scripts/export_reference.py apps/stablemimic/scripts/odometry_bridge.py
         DESTINATION apps/stablemimic/scripts)
 endif()

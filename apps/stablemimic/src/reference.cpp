@@ -104,6 +104,15 @@ std::vector<ReferenceFrame> LoadReference(const std::string& path) {
     return frames;
 }
 
+ReferenceFrame LoadStandingReference(const std::string& path) {
+    const auto standing = LoadReference(path);
+    const auto& velocity = standing.front().command.velocity;
+    if (standing.size() != 1 ||
+        !std::all_of(velocity.begin(), velocity.end(), [](double dq) { return std::abs(dq) <= 1e-6; }))
+        throw std::runtime_error("Standing reference must be one frame with zero joint velocities");
+    return standing.front();
+}
+
 Playback::Playback(ReferenceFrame standing, std::vector<ReferenceFrame> motion, std::size_t first_frame)
     : standing_(std::move(standing)), motion_(std::move(motion)), first_frame_(first_frame), cursor_(first_frame) {
     if (first_frame_ >= (motion_.empty() ? 1 : motion_.size()))

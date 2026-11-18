@@ -8,6 +8,7 @@ from pathlib import Path
 from queue import Empty, SimpleQueue
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 import time
 
 import mujoco as mj
@@ -123,6 +124,13 @@ class OperatorControl:
         self.started_at = 0.0
         self.active_steps = 0
 
+    def take_over(self):
+        self.phase = "ready"
+        return "Control enabled. Damping only"
+
+    def reference_complete(self):
+        return self.sim.frame >= self.sim.end
+
     def begin(self):
         sim = self.sim
         sim.session.reset()
@@ -137,6 +145,7 @@ class OperatorControl:
         self.started_at = sim.data.time
         self.active_steps = 0
         self.phase = "running"
+        return f"Policy started from current pose at {sim.data.time:.2f}s"
 
     def stop(self):
         self.phase = "limp"
@@ -175,7 +184,118 @@ class OperatorControl:
         return None
 
 
-def run_operator(sim, control, period, max_steps, log_step):
+class HardwareOperatorControl:
+    def __init__(self, process, sim, policy_names, period):
+        self.process = process
+        self.sim = sim
+        header = process.stdout.readline().split()
+        names = header[3:]
+        if header[:3] != ["g1-stablemimic-hardware-v1", "20", "2"] or len(names) != 29 or set(names) != set(policy_names):
+            raise RuntimeError("Unexpected StableMimic hardware simulation handshake")
+        self.joint_names = names
+        self.dds_order = [policy_names.index(name) for name in names]
+        self.policy_order = np.argsort(self.dds_order)
+        sim.model.opt.timestep = int(header[2]) / 1000
+        self.substeps = round(period / sim.model.opt.timestep)
+        self.phase = "limp"
+        self.active_steps = 0
+        self.failure = None
+
+    def request(self, command):
+        if command in ("reset", "telemetry"):
+            line = command
+        else:
+            sim, order = self.sim, self.dds_order
+            data = sim.data
+            velocity = np.empty(6)
+            mj.mj_objectVelocity(sim.model, data, mj.mjtObj.mjOBJ_BODY, sim.pelvis, velocity, 0)
+            state = np.concatenate((data.qpos[sim.qpos_ids][order], data.qvel[sim.qvel_ids][order],
+                                    data.xpos[sim.pelvis], data.xmat[sim.pelvis], velocity))
+            line = command + " " + " ".join(map(str, state))
+        self.process.stdin.write(line + "\n")
+        self.process.stdin.flush()
+        response = self.process.stdout.readline().strip()
+        if not response:
+            raise RuntimeError("StableMimic hardware simulation stream exited")
+        return response
+
+    def entry_error(self):
+        reply = self.request("check")
+        if reply == "ready":
+            return None
+        if reply == "unready":
+            return "Wait for the robot to settle"
+        if reply.startswith("fault "):
+            return reply.removeprefix("fault ")
+        raise RuntimeError("Unexpected StableMimic hardware entry response")
+
+    def take_over(self):
+        error = self.entry_error()
+        if error:
+            return f"Takeover blocked. {error}"
+        self.phase = "ready"
+        return "Control enabled. Damping only"
+
+    def begin(self):
+        error = self.entry_error()
+        if error:
+            return f"Start blocked. {error}"
+        if self.request("reset") != "ok":
+            raise RuntimeError("C++ StableMimic did not acknowledge hardware reset")
+        self.phase = "running"
+        self.active_steps = 0
+        return f"Policy started from current pose at {self.sim.data.time:.2f}s"
+
+    def stop(self):
+        self.phase = "limp"
+        self.failure = None
+        self.sim.data.ctrl.fill(0)
+
+    def reference_complete(self):
+        # The real controller tracks the standing reference after the final motion frame.
+        return False
+
+    def advance(self):
+        sim, record = self.sim, None
+        data = sim.data
+        now = data.time
+        peak_torque = 0.0
+        for _ in range(self.substeps):
+            data.ctrl.fill(0)
+            if self.phase in ("ready", "running"):
+                command = "track" if self.phase == "running" else "damping"
+                reply = self.request(command)
+                if reply.startswith("fault "):
+                    self.failure = reply.removeprefix("fault ")
+                    self.phase = "fault"
+                else:
+                    kind, *values = reply.split()
+                    if kind != command:
+                        raise RuntimeError("Unexpected StableMimic hardware command response")
+                    if kind == "track":
+                        frame, realigned, holding, tracking, recovery, *values = values
+                        if record is None:
+                            record = {"time": now, "frame": int(frame), "xy_realigned": realigned == "1",
+                                      "standing_reference": holding == "1", "gate": [float(tracking), float(recovery)],
+                                      "pelvis_height": float(data.xpos[sim.pelvis, 2]),
+                                      "pelvis_tilt_deg": math.degrees(math.acos(np.clip(data.xmat[sim.pelvis, 8], -1, 1)))}
+                    torque = np.asarray(values, dtype=float)
+                    if torque.shape != (29,) or not np.isfinite(torque).all():
+                        raise RuntimeError("Invalid StableMimic hardware torque response")
+                    data.ctrl[sim.motor_ids] = torque[self.policy_order]
+            mj.mj_step(sim.model, data)
+            peak_torque = max(peak_torque, float(np.abs(data.qfrc_actuator[sim.qvel_ids]).max()))
+            mj.mj_forward(sim.model, data)
+        if not np.isfinite(data.qpos).all() or not np.isfinite(data.qvel).all():
+            raise RuntimeError("Invalid StableMimic hardware MuJoCo integration")
+        if record is not None and not self.failure:
+            record["peak_torque_nm"] = peak_torque
+            self.active_steps += 1
+            return record
+        return None
+
+
+def run_operator(sim, control, period, max_steps, log_step, monitor=None):
     import glfw
     from mujoco.viewer import launch_passive
 
@@ -208,17 +328,20 @@ def run_operator(sim, control, period, max_steps, log_step):
                     control.stop()
                     message = "Stopped. Limp"
                 elif control.phase == "limp" and {glfw.KEY_9, glfw.KEY_KP_9} & pressed:
-                    control.phase = "ready"
-                    message = "Control enabled. Damping only"
+                    message = control.take_over()
                 elif control.phase == "ready" and glfw.KEY_P in pressed:
-                    control.begin()
-                    message = f"Policy started from current pose at {sim.data.time:.2f}s"
+                    message = control.begin()
+                phase = control.phase
                 record = control.advance()
-                if record is not None:
+                if monitor is not None:
+                    monitor.update(sim.data, control.phase, control.failure)
+                if phase != "fault" and control.phase == "fault":
+                    message = f"Protection stop: {control.failure}. Space acknowledges"
+                elif record is not None:
                     completed += 1
                     last = record
                     message = log_step(record) or message
-                    if sim.frame >= sim.end or (max_steps is not None and control.active_steps >= max_steps):
+                    if control.reference_complete() or (max_steps is not None and control.active_steps >= max_steps):
                         control.phase = "ready"
                         message = "Run complete. Damping only"
             if message:
@@ -251,7 +374,8 @@ def run(args):
     steps = args.steps if args.steps is not None else 1000
     if args.motion_file:
         sim = Sim2Sim(model, args.motion_file.resolve(), args.start_frame)
-        steps = min(steps, sim.end - args.start_frame)
+        if not args.hardware_config:
+            steps = min(steps, sim.end - args.start_frame)
     else:
         from evaluate_getup_mujoco import StandingSim
 
@@ -272,9 +396,18 @@ def run(args):
     realignments = []
     with ExitStack() as resources:
         trace = resources.enter_context(args.trace.open("x", encoding="utf-8", buffering=1)) if args.trace else None
+        mode = "sim-hardware-stream" if args.hardware_config else "sim-stream"
+        command = [binary, mode, "--config", config_path, "--model", model]
+        if args.hardware_config and args.motion_file:
+            sys.path.insert(0, str(PROJECT_ROOT / "apps/stablemimic/scripts"))
+            from export_reference import export_reference
+
+            temp = Path(resources.enter_context(TemporaryDirectory(prefix="stablemimic-reference-")))
+            motion = temp / "motion.txt"
+            export_reference(args.motion_file.resolve(), motion, standing=False)
+            command += ["--motion", motion, "--start-frame", str(args.start_frame)]
         process = resources.enter_context(subprocess.Popen(
-            [binary, "sim-stream", "--config", config_path, "--model", model], stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, encoding="ascii", bufsize=1))
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, encoding="ascii", bufsize=1))
 
         def log_step(record):
             if trace is not None:
@@ -286,20 +419,55 @@ def run(args):
             return None
 
         try:
-            sim.session = CheckedSession(process, sim, metadata["joint_names"], rotation_xyzw)
+            if args.hardware_config:
+                control = HardwareOperatorControl(process, sim, metadata["joint_names"], CONTROL_DT)
+            else:
+                sim.session = CheckedSession(process, sim, metadata["joint_names"], rotation_xyzw)
+                if args.viewer:
+                    control = OperatorControl(sim, settings, SUBSTEPS)
             last = None
             completed = 0
             if args.viewer:
-                control = OperatorControl(sim, settings, SUBSTEPS)
-                completed, last = run_operator(sim, control, CONTROL_DT, args.steps, log_step)
+                monitor = None
+                if args.monitor is not None:
+                    from joint_web_monitor import SimulationMonitor
+
+                    monitor = resources.enter_context(SimulationMonitor(
+                        args.monitor, "StableMimic", sim.model, control.joint_names,
+                        sim.qpos_ids[control.dds_order], sim.qvel_ids[control.dds_order],
+                        "qfrc_actuator", lambda: control.request("telemetry")))
+                completed, last = run_operator(sim, control, CONTROL_DT, args.steps, log_step, monitor)
+            elif args.hardware_config:
+                for _ in range(round(2 / CONTROL_DT)):
+                    control.advance()
+                print(f"StableMimic: {control.take_over()}", file=sys.stderr)
+                if control.phase != "ready":
+                    raise RuntimeError("Hardware takeover rejected")
+                for _ in range(round(0.5 / CONTROL_DT)):
+                    control.advance()
+                    if control.failure:
+                        raise RuntimeError(f"Protection stop: {control.failure}")
+                print(f"StableMimic: {control.begin()}", file=sys.stderr)
+                if control.phase != "running":
+                    raise RuntimeError("Hardware policy start rejected")
+                for _ in range(steps):
+                    last = control.advance()
+                    if control.failure:
+                        raise RuntimeError(f"Protection stop: {control.failure}")
+                    log_step(last)
+                    completed += 1
             else:
                 for _ in range(steps):
                     last = sim.step()
                     log_step(last)
                     completed += 1
-            report = {"control_steps": completed, "sim_time": sim.data.time,
-                      "max_cpp_python_error": sim.session.errors, "last": last}
-            if args.library and not args.motion_file:
+            report = {"control_steps": completed, "sim_time": sim.data.time, "last": last}
+            if args.hardware_config:
+                report.update({"motor_period_ms": 1000 * sim.model.opt.timestep,
+                               "policy_period_ms": 1000 * CONTROL_DT, "fault": control.failure})
+            else:
+                report["max_cpp_python_error"] = sim.session.errors
+            if args.library and not args.motion_file and not args.hardware_config:
                 report["standing_metrics"] = sim.metrics()
             if args.motion_file:
                 report["xy_realignments"] = realignments
@@ -326,9 +494,15 @@ def main():
     parser.add_argument("--steps", type=int, help="Maximum policy steps per run (headless default: 1000)")
     parser.add_argument("--trace", type=Path, help="Save per-step reference frames and Gate weights to a new JSONL file")
     parser.add_argument("--viewer", action="store_true", help="Open MuJoCo with manual 9, P and Space controls")
+    parser.add_argument("--hardware-config", action="store_true",
+                        help="Use the real StableMimic control period, motion protection and reference playback")
+    parser.add_argument("--monitor", nargs="?", const=8765, type=int, metavar="PORT",
+                        help="Serve the joint dashboard on localhost (default port 8765)")
     args = parser.parse_args()
     if args.steps is not None and args.steps <= 0:
         parser.error("--steps must be positive")
+    if args.monitor is not None and not (args.hardware_config and args.viewer and 0 <= args.monitor <= 65535):
+        parser.error("--monitor requires --hardware-config and --viewer, with a valid port")
     if not (args.library or args.motion_file):
         parser.error("Specify --library, --motion-file, or both")
     if (args.start_frame and not args.motion_file) or (args.pose_index and not args.library):

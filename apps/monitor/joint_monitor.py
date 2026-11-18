@@ -207,16 +207,18 @@ class JointMonitor:
                 "enabled": enable[i] if enable_fresh else None,
                 "active": command_fresh and any(v != 0 for v in actual_command[2:]),
             })
-        state = {"sample_id": self.snapshot["sample_id"] + 1,
-                 "dry_run": dry_run,
+        self.publish_snapshot({"dry_run": dry_run,
                  "simulation_time": now - self.started_at, "joints": joints,
                  "output_enabled": enable[0] if enable_fresh else None,
-                 "imu": read_imu(msg)}
+                 "imu": read_imu(msg)}, now)
+
+    def publish_snapshot(self, state, now):
         try:
             json.dumps(state, allow_nan=False)
         except ValueError:
             return
         with self.changed:
+            state["sample_id"] = self.snapshot["sample_id"] + 1
             self.snapshot = state
             self.last_capture = now
             # Keep a fixed schedule rather than adding callback jitter to each period.

@@ -19,6 +19,7 @@ struct ReferenceFrame {
 };
 
 std::vector<ReferenceFrame> LoadReference(const std::string& path);
+ReferenceFrame LoadStandingReference(const std::string& path);
 
 class Playback {
 public:

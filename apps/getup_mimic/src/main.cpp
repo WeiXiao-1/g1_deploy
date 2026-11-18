@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -163,6 +164,7 @@ int RunHardwareSimulationStream(const std::string& config_path) {
     WriteJointNames();
 
     MotorTargets targets{};
+    std::optional<MotorTargets> telemetry;
     RecoveryProgress progress;
     int tick = 0;
     std::string line;
@@ -174,8 +176,20 @@ int RunHardwareSimulationStream(const std::string& config_path) {
             RequireEndOfCommand(input);
             policy.Reset();
             progress.Reset();
+            telemetry.reset();
             tick = 0;
             std::cout << "ok" << std::endl;
+            continue;
+        }
+        if (command == "telemetry") {
+            RequireEndOfCommand(input);
+            if (!telemetry) {
+                std::cout << "none" << std::endl;
+                continue;
+            }
+            for (const auto* values : {&telemetry->position, &telemetry->kp, &telemetry->kd})
+                for (float value : *values) std::cout << value << ' ';
+            std::cout << std::endl;
             continue;
         }
         if (command != "check" && command != "damping" && command != "getup") {
@@ -207,10 +221,12 @@ int RunHardwareSimulationStream(const std::string& config_path) {
                 }
             }
             const auto actuation = ComputeActuation(settings, state, active_targets, weight);
+            telemetry = actuation.applied;
             std::cout << phase;
             for (float torque : actuation.torque) std::cout << ' ' << torque;
             std::cout << std::endl;
         } catch (const std::runtime_error& error) {
+            telemetry.reset();
             std::cout << "fault " << error.what() << std::endl;
         }
     }

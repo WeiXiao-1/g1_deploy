@@ -1,11 +1,14 @@
-#include "g1_stablemimic_policy.h"
+#include "g1_stablemimic_control.h"
+#include "g1_stablemimic_reference.h"
 
 #include "g1_config_utils.h"
 #include "g1_control_options.h"
 #include "g1_joint_mapping.h"
+#include "g1_loop_scheduler.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -159,6 +162,96 @@ int RunStream(Policy& policy) {
     return 0;
 }
 
+int RunHardwareStream(Policy& policy, const HardwareSettings& settings, Playback& playback) {
+    constexpr auto control_period = g1_control::kControlPeriod;
+    static_assert(kPolicyPeriod % control_period == std::chrono::milliseconds::zero());
+    constexpr auto steps_per_inference = kPolicyPeriod / control_period;
+    std::cout << "g1-stablemimic-hardware-v1 " << kPolicyPeriod.count() << ' ' << control_period.count();
+    for (const auto& name : g1_joints::kDdsNames) std::cout << ' ' << name;
+    std::cout << std::endl << std::setprecision(std::numeric_limits<double>::max_digits10);
+
+    Result result;
+    Playback::Sample sample{};
+    std::optional<Actuation> telemetry;
+    std::uint64_t tick = 0;
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        std::istringstream input(line);
+        std::string command, extra;
+        input >> command;
+        if (command == "reset") {
+            if (input >> extra) throw std::runtime_error("Unexpected data after StableMimic reset");
+            policy.Reset();
+            playback.Reset();
+            telemetry.reset();
+            tick = 0;
+            std::cout << "ok" << std::endl;
+            continue;
+        }
+        if (command == "telemetry") {
+            if (input >> extra) throw std::runtime_error("Unexpected data after StableMimic telemetry request");
+            if (!telemetry) {
+                std::cout << "none" << std::endl;
+                continue;
+            }
+            WriteValues(telemetry->position);
+            WriteValues(telemetry->kp);
+            WriteValues(telemetry->kd);
+            std::cout << std::endl;
+            continue;
+        }
+        if (command != "check" && command != "damping" && command != "track")
+            throw std::runtime_error("Unknown StableMimic hardware stream command");
+        State state;
+        Vector3 pelvis_position;
+        auto read = [&input](auto& values) {
+            for (auto& value : values)
+                if (!(input >> value) || !std::isfinite(value))
+                    throw std::runtime_error("Invalid StableMimic hardware simulation state");
+        };
+        try {
+            read(state.position);
+            read(state.velocity);
+            read(pelvis_position);
+            read(state.pelvis_rotation);
+            read(state.pelvis_angular_velocity_world);
+            read(state.pelvis_linear_velocity_world);
+            if (input >> extra) throw std::runtime_error("Unexpected StableMimic hardware stream data");
+            CheckMeasuredPositions(settings, state.position);
+            if (command == "check") {
+                std::cout << (Resting(settings, state) ? "ready" : "unready") << std::endl;
+                continue;
+            }
+            const Joints* target = nullptr;
+            float weight = 0;
+            const bool infer = command == "track" && tick % steps_per_inference == 0;
+            if (command == "track") {
+                if (infer) {
+                    SetTorsoPose(state, pelvis_position);
+                    sample = playback.Step(state, pelvis_position);
+                    result = policy.Step(state, sample.command);
+                }
+                target = &result.target;
+                weight = RampWeight(settings, control_period.count() * 0.001 * tick);
+                ++tick;
+            }
+            const auto actuation = ComputeActuation(settings, policy.Drive(), state, target, weight);
+            telemetry = actuation;
+            std::cout << command << ' ';
+            if (target) {
+                std::cout << sample.frame << ' ' << (infer && sample.realigned) << ' ' << sample.holding << ' ';
+                WriteValues(result.gate_weights);
+            }
+            WriteValues(actuation.torque);
+            std::cout << std::endl;
+        } catch (const std::runtime_error& error) {
+            telemetry.reset();
+            std::cout << "fault " << error.what() << std::endl;
+        }
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -166,23 +259,40 @@ int main(int argc, char** argv) {
         const std::string mode = argc > 1 ? argv[1] : "--help";
         if (mode == "--help" || mode == "help") {
             std::cout << "Usage: g1_stablemimic check [--config JSON] [--model ONNX] [--fixture JSON]\n"
-                      << "       g1_stablemimic sim-stream [--config JSON] [--model ONNX]\n";
+                      << "       g1_stablemimic sim-stream [--config JSON] [--model ONNX]\n"
+                      << "       g1_stablemimic sim-hardware-stream [--config JSON] [--model ONNX]"
+                         " [--motion REFERENCE.txt] [--start-frame INDEX]\n";
             return 0;
         }
-        if (mode != "check" && mode != "sim-stream") throw std::invalid_argument("Expected check or sim-stream");
+        if (mode != "check" && mode != "sim-stream" && mode != "sim-hardware-stream")
+            throw std::invalid_argument("Unknown StableMimic subcommand: " + mode);
         std::string config = G1_STABLEMIMIC_DEFAULT_CONFIG;
         std::optional<std::string> model, fixture;
+        std::string motion;
+        int start_frame = 0;
         for (int i = 2; i < argc; ++i) {
             const std::string option = argv[i];
             if (option == "--config") config = g1_control::OptionValue(argc, argv, i, option);
             else if (option == "--model") model = g1_control::OptionValue(argc, argv, i, option);
             else if (option == "--fixture" && mode == "check") fixture = g1_control::OptionValue(argc, argv, i, option);
+            else if (option == "--motion" && mode == "sim-hardware-stream")
+                motion = g1_control::OptionValue(argc, argv, i, option);
+            else if (option == "--start-frame" && mode == "sim-hardware-stream")
+                start_frame = g1_control::ParseInteger(g1_control::OptionValue(argc, argv, i, option));
             else throw std::invalid_argument("Unknown option: " + option);
         }
         const auto settings = YAML::LoadFile(config);
         if (!model) model = g1_config::ResolvePath(config, settings["policy_path"].as<std::string>());
         Policy policy(*model);
         if (mode == "sim-stream") return RunStream(policy);
+        if (mode == "sim-hardware-stream") {
+            if (start_frame < 0) throw std::invalid_argument("Start frame must be nonnegative");
+            const HardwareSettings hardware(settings);
+            Playback playback(LoadStandingReference(g1_config::ResolvePath(config, hardware.standing_reference)),
+                              motion.empty() ? std::vector<ReferenceFrame>{} : LoadReference(motion),
+                              static_cast<std::size_t>(start_frame));
+            return RunHardwareStream(policy, hardware, playback);
+        }
         if (!fixture) fixture = g1_config::ResolvePath(config, settings["check_path"].as<std::string>());
         return CheckPolicy(policy, *fixture);
     } catch (const std::exception& error) {

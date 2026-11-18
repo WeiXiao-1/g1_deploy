@@ -26,6 +26,8 @@ def main():
     getup.add_argument("--interactive", action="store_true", help="Use 9 to take over, P to get up and Space to stop")
     getup.add_argument("--hardware-config", action="store_true",
                        help="Use the real GetUpMimic control period and motion protections in MuJoCo")
+    getup.add_argument("--monitor", nargs="?", const=8765, type=int, metavar="PORT",
+                       help="Serve the joint dashboard on localhost (default port 8765)")
     parser.add_argument("--domain", type=int, default=1)
     parser.add_argument("--depth", action=argparse.BooleanOptionalAction, default=True,
                         help="Publish Parkour depth observations (DWaQ ignores them)")
@@ -46,21 +48,24 @@ def main():
             parser.error("DDS domain, terrain generation and depth preview require --mujoco-root")
         if args.interactive and args.headless:
             parser.error("--interactive requires the MuJoCo viewer")
+        if args.monitor is not None and not (args.hardware_config and args.interactive and 0 <= args.monitor <= 65535):
+            parser.error("--monitor requires --hardware-config and --interactive, with a valid port")
         try:
             if not args.headless:
                 select_window_backend(args.window_backend)
             from getup_mimic_sim import run
 
             return run(PROJECT_ROOT, args.mjcf, args.pose or "all", args.headless, args.follow,
-                       args.interactive, args.hardware_config)
+                       args.interactive, args.hardware_config, args.monitor)
         except ModuleNotFoundError as error:
             parser.exit(1, f"GetUpMimic requires a Python environment with MuJoCo and NumPy: {error}\n")
         except (KeyError, OSError, RuntimeError, ValueError) as error:
             parser.exit(1, f"GetUpMimic: {error}\n")
         except KeyboardInterrupt:
             parser.exit(130, "GetUpMimic interrupted\n")
-    if args.mjcf is not None or args.pose is not None or args.headless or args.interactive or args.hardware_config:
-        parser.error("--mjcf, --pose, --headless, --interactive and --hardware-config require --getup-mimic")
+    if (args.mjcf is not None or args.pose is not None or args.headless or args.interactive
+            or args.hardware_config or args.monitor is not None):
+        parser.error("GetUpMimic simulation options require --getup-mimic")
     if args.mujoco_root is None:
         parser.error("--mujoco-root is required for the DDS environment")
     if args.domain <= 0:

@@ -138,6 +138,13 @@ python apps/simulation/stablemimic_sim.py --stablemimic-root /path/to/stablemimi
 
 窗口打开时机器人脱力，重力和地面接触持续生效。点击 MuJoCo 窗口，按 `9` 接管并进入阻尼待命，再按 `P` 清空观测历史、从当前姿态启动策略。策略力矩按独立配置渐入，默认 180 ms。按空格立即清零电机力矩并回到脱力状态，可再次按 `9 → P`。省略 `--viewer` 会自动开始离屏对拍。
 
+加 `--hardware-config` 可走 StableMimic 实机的 C++ 控制路径。仿真按 2 ms 步进，每 20 ms 推理一次，使用 StableMimic 实机的起动条件、力矩渐入、角度与速度保护、力矩上限和参考动作逻辑。骨盆和关节观测取自 MuJoCo。实测角度越界触发保护时，仿真清零力矩并显示关节名。按空格确认退出保护，再按 `9 → P` 可从当前姿态重试。舞蹈播完后跟踪固定站立参考。此模式下省略 `--viewer` 会先脱力 2 秒、阻尼待命 0.5 秒，再启动策略，可用 `--steps` 限制测试长度。
+
+```bash
+python3 apps/simulation/stablemimic_sim.py --stablemimic-root /path/to/stablemimic \
+  --hardware-config --library backup --motion-file /path/to/dance1_subject1.npz --viewer
+```
+
 ### StableMimic 实机
 
 完整构建包含 `g1_stablemimic_real`。仅构建这两个独立控制器时，在原有 SDK2 和 ONNX Runtime 配置上设置 `-DG1_GETUP_MIMIC_ONLY=ON -DG1_GETUP_MIMIC_REAL=ON -DG1_STABLEMIMIC=ON`。
@@ -162,12 +169,13 @@ python3 apps/stablemimic/scripts/odometry_bridge.py eth0 --odom /pelvis/odom
 
 策略每 20 ms 推理，2 ms 低层循环对 29 路电机计算 PD 力矩。实机关节范围、速度和力矩上限在 StableMimic 的 `hardware` 配置内，速度和力矩取硬件配置与模型元数据的较小值。此配置的初值来自 G1 29DOF 描述，腰部 roll 和 pitch 为 ±0.52 rad。上机前按具体机型核对这些值。 [Unitree G1 29DOF URDF](https://github.com/unitreerobotics/unitree_rl_gym/blob/main/resources/robots/g1_description/g1_29dof.urdf)
 
-实机默认用随安装包提供的固定站立参考。舞蹈可在开发机用装有 NumPy 的 Python 将已有 50 Hz NPZ 转换后复制到机载端，`--start-frame` 默认为 0。
+实机默认跟踪固定站立参考。训练所用的 8 条 50 Hz 舞蹈已在 `apps/stablemimic/references/dance/` 中提供 TXT，并随实机安装包安装。用 `--motion` 选择其中一条，`--start-frame` 默认为 0。
 
 ```bash
-python3 apps/stablemimic/scripts/export_reference.py /path/to/dance1_subject1.npz /tmp/dance1.txt
-./g1 stablemimic real eth0 --motion /tmp/dance1.txt --start-frame 0
+./g1 stablemimic real eth0 --motion apps/stablemimic/references/dance/dance1_subject1.txt
 ```
+
+其他 50 Hz NPZ 可在开发机用装有 NumPy 的 Python 执行 `apps/stablemimic/scripts/export_reference.py` 转成同一格式。
 
 舞蹈从策略启动起每 20 ms 前进一帧。起身和跟踪由模型的 Gate 选择，恢复直立后对齐当时的舞蹈帧的水平位置。舞蹈播完后用同一策略跟踪站立参考。
 
@@ -336,6 +344,8 @@ python3 apps/monitor/joint_monitor.py --domain 0 --interface eth0 --host 0.0.0.0
 
 浏览器打开 `http://机器人IP:8765/`（本机仿真用 `http://127.0.0.1:8765/`）。网页显示 29 关节状态、IMU、真实命令及空跑目标，过期数据显示离线；网页不能发送运动命令，Ctrl+C 结束服务。
 安装后使用 `./g1 monitor eth0 0.0.0.0 8765`。包装脚本省略监听地址和端口时，默认 `127.0.0.1:8765`。
+
+GetUpMimic 和 StableMimic 的独立 MuJoCo 窗口也可使用同一网页。在 GetUpMimic 的 `--hardware-config --interactive` 或 StableMimic 的 `--hardware-config --viewer` 命令后加 `--monitor 8767`，再用本机浏览器打开 `http://127.0.0.1:8767/`。省略端口时，`--monitor` 默认使用 8765。仿真直接给网页提供关节反馈和 C++ 控制器目标，无需另启 DDS 监控服务。按键继续在 MuJoCo 窗口操作。关闭窗口时，关联的网页服务随仿真退出。
 
 ## 快速使用：原配遥控器与网页
 

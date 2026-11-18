@@ -43,7 +43,7 @@ def export_reference(source, output, standing):
     with output.open("x", encoding="utf-8") as stream:
         stream.write("g1-stablemimic-reference-v1 50 " + " ".join(joints) + "\n")
         np.savetxt(stream, data, fmt="%.9g")
-    print(f"Exported {len(data)} frames at 50 Hz to {output}")
+    return len(data)
 
 
 if __name__ == "__main__":
@@ -52,4 +52,5 @@ if __name__ == "__main__":
     parser.add_argument("output", type=Path)
     parser.add_argument("--standing", action="store_true", help="Export one static standing frame")
     args = parser.parse_args()
-    export_reference(args.npz, args.output, args.standing)
+    frames = export_reference(args.npz, args.output, args.standing)
+    print(f"Exported {frames} frames at 50 Hz to {args.output}")

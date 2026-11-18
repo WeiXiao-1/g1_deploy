@@ -88,6 +88,9 @@ class PolicyStream:
             raise RuntimeError("Invalid GetUpMimic hardware simulation output")
         return phase, torque
 
+    def telemetry(self):
+        return self._request("telemetry").strip()
+
 
 @contextmanager
 def open_policy(project_root, hardware=False):
@@ -407,7 +410,7 @@ def open_viewer(stack, simulation, follow, key_callback=None):
     return viewer
 
 
-def run_interactive(simulation, poses, viewer, keys):
+def run_interactive(simulation, poses, viewer, keys, monitor=None):
     import glfw
 
     pose_index = 0
@@ -468,6 +471,11 @@ def run_interactive(simulation, poses, viewer, keys):
         # Gravity and contact advance in every phase, including with zero motor torque.
         with viewer.lock():
             message = session.advance()
+            if monitor is not None:
+                phase = session.phase
+                if phase == "fault" and simulation.data.time < session.damping_until:
+                    phase = "fault-damping"
+                monitor.update(simulation.data, phase, session.failure if session.phase == "fault" else None)
         if message:
             show(message)
         tick += 1
@@ -475,7 +483,7 @@ def run_interactive(simulation, poses, viewer, keys):
     return 0
 
 
-def run(project_root, mjcf, kind, headless, follow, interactive=False, hardware=False):
+def run(project_root, mjcf, kind, headless, follow, interactive=False, hardware=False, monitor_port=None):
     if not mjcf.is_file():
         raise FileNotFoundError(f"MJCF file not found: {mjcf}")
     settings_path = project_root / "apps/getup_mimic/config/g1_getup_mimic_sim.json"
@@ -492,10 +500,17 @@ def run(project_root, mjcf, kind, headless, follow, interactive=False, hardware=
             print(f"GetUpMimic MuJoCo hardware config | policy {policy.period * 1000:g} ms"
                   f" / control and physics {policy.control_period * 1000:g} ms", flush=True)
         if interactive:
+            monitor = None
+            if monitor_port is not None:
+                from joint_web_monitor import SimulationMonitor
+
+                monitor = stack.enter_context(SimulationMonitor(
+                    monitor_port, "GetUpMimic", simulation.model, policy.joint_names,
+                    simulation.joint_q, simulation.joint_dq, "qfrc_applied", policy.telemetry))
             simulation.reset(poses[0])
             keys = SimpleQueue()
             viewer = open_viewer(stack, simulation, follow, keys.put)
-            return run_interactive(simulation, poses, viewer, keys)
+            return run_interactive(simulation, poses, viewer, keys, monitor)
         if hardware:
             print(f"{len(poses)} cases | limp {AUTO_LIMP_SECONDS:g} s, standby {AUTO_STANDBY_SECONDS:g} s,"
                   f" recovery {policy.timeout:g} s", flush=True)
