@@ -20,6 +20,8 @@ Usage:
   ./g1 getup-mimic check [--config JSON]     Offline GetUpMimic model and target checks
   ./g1 getup-mimic read-only INTERFACE     Inspect GetUpMimic hardware state
   ./g1 getup-mimic real INTERFACE          GetUpMimic hardware control, starts in dry run
+  ./g1 model_test check [--expert NAME]   Offline single-frame get-up expert checks
+  ./g1 model_test read-only|real INTERFACE [--expert NAME]
   ./g1 stablemimic check [--config JSON]   Offline StableMimic reference parity checks
   ./g1 stablemimic read-only INTERFACE     Inspect G1 and StableMimic base estimate
   ./g1 stablemimic real INTERFACE          StableMimic hardware control, starts in dry run
@@ -85,11 +87,16 @@ if [[ "$mode" == stablemimic ]]; then
         *) stablemimic_usage >&2; exit 2 ;;
     esac
 fi
-if [[ "$mode" == getup-mimic ]]; then
+if [[ "$mode" == getup-mimic || "$mode" == model_test ]]; then
     getup_mode="${1:-help}"
+    expert_args=()
+    if [[ "$mode" == model_test ]]; then expert_args=(--expert faceup); fi
     getup_usage() {
-        printf '%s\n' 'Usage: ./g1 getup-mimic check [--config JSON]' \
-            '       ./g1 getup-mimic read-only|real INTERFACE [--config JSON]'
+        printf '%s\n' "Usage: ./g1 $mode check [--config JSON]" \
+            "       ./g1 $mode read-only|real INTERFACE [--config JSON]"
+        if [[ "$mode" == model_test ]]; then
+            printf '%s\n' 'Options: --expert faceup|backup (default: faceup)'
+        fi
     }
     case "$getup_mode" in
         help|--help)
@@ -100,7 +107,7 @@ if [[ "$mode" == getup-mimic ]]; then
             shift
             controller="$bin_dir/g1_getup_mimic"
             [[ -x "$controller" ]] || { echo "Missing executable: $controller" >&2; exit 1; }
-            exec "$controller" check --config "$package_dir/apps/getup_mimic/config/g1_getup_mimic.json" "$@"
+            exec "$controller" check --config "$package_dir/apps/getup_mimic/config/g1_getup_mimic.json" "${expert_args[@]}" "$@"
             ;;
         read-only|real)
             shift
@@ -108,7 +115,7 @@ if [[ "$mode" == getup-mimic ]]; then
             robot_interface="$1"; shift
             controller="$bin_dir/g1_getup_mimic_real"
             [[ -x "$controller" ]] || { echo 'Build GetUpMimic with Unitree SDK2 (G1_GETUP_MIMIC_REAL=ON in a standalone build).' >&2; exit 1; }
-            exec "$controller" "$getup_mode" "$robot_interface" --config "$package_dir/apps/getup_mimic/config/g1_getup_mimic.json" "$@"
+            exec "$controller" "$getup_mode" "$robot_interface" --config "$package_dir/apps/getup_mimic/config/g1_getup_mimic.json" "${expert_args[@]}" "$@"
             ;;
         *) getup_usage >&2; exit 2 ;;
     esac

@@ -2,9 +2,11 @@
 
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <memory>
 #include <onnxruntime_cxx_api.h>
 #include <string>
+#include <yaml-cpp/yaml.h>
 
 namespace g1_getup_mimic {
 
@@ -16,6 +18,16 @@ inline constexpr auto kPolicyPeriod = std::chrono::milliseconds(10);
 
 using Joints = std::array<float, kJointCount>;
 using Observation = std::array<float, kObservationSize>;
+
+struct PolicyConfig {
+    PolicyConfig(const std::string& config_path, const std::string& expert);
+
+    std::string path;
+    YAML::Node root;
+    YAML::Node model;
+    int observation_size = kObservationSize;
+    float action_clip = 0.f;
+};
 
 struct State {
     Joints position{}, velocity{};  // DDS motor order, rad and rad/s
@@ -31,13 +43,13 @@ struct MotorTargets {
 
 class Policy {
 public:
-    explicit Policy(const std::string& config_path);
+    explicit Policy(const PolicyConfig& config);
 
     MotorTargets Step(const State& state);
     void Reset();
 
     // Exposes the model boundary for checking exported observation/action pairs.
-    Joints Predict(Observation& observation);
+    Joints Predict(float* observation, std::size_t size);
 
 private:
     using Frame = std::array<float, kFrameSize>;
@@ -50,6 +62,8 @@ private:
     Joints default_position_{}, action_scale_{}, last_action_{};
     Joints motor_kp_{}, motor_kd_{};
     std::array<Frame, kHistoryFrames> history_{};
+    int observation_size_;
+    float action_clip_;
     bool history_ready_ = false;
 };
 

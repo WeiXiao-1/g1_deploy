@@ -19,9 +19,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mujoco-root", type=Path, help="External unitree_mujoco checkout for the DDS environment")
     getup = parser.add_argument_group("GetUpMimic")
-    getup.add_argument("--getup-mimic", action="store_true", help="Run fixed fallen-pose recovery cases")
+    getup_mode = getup.add_mutually_exclusive_group()
+    getup_mode.add_argument("--getup-mimic", action="store_true", help="Run fixed fallen-pose recovery cases")
+    getup_mode.add_argument("--model_test", "--model-test", action="store_true",
+                            help="Run a single-frame get-up expert")
+    getup.add_argument("--expert", help="model_test profile (faceup or backup, default: faceup)")
     getup.add_argument("--mjcf", type=Path, help="Path to g1.xml from the GetUpMimic training bundle")
-    getup.add_argument("--pose", choices=("all", "backup", "faceup"), help="Recovery cases to run (default: all)")
+    getup.add_argument("--pose", choices=("all", "backup", "faceup"),
+                       help="Recovery cases to run (default: all for GetUpMimic, selected pose for model_test)")
     getup.add_argument("--headless", action="store_true", help="Run GetUpMimic without opening the viewer")
     getup.add_argument("--interactive", action="store_true", help="Use 9 to take over, P to get up and Space to stop")
     getup.add_argument("--hardware-config", action="store_true",
@@ -41,9 +46,11 @@ def main():
     parser.add_argument("--window-backend", choices=("auto", "x11", "wayland"), default="x11",
                         help="Window backend (default: x11); auto prefers X11/XWayland when DISPLAY is available")
     args = parser.parse_args()
-    if args.getup_mimic:
+    if args.expert is not None and (not args.model_test or not args.expert):
+        parser.error("--expert requires --model_test and a profile name")
+    if args.getup_mimic or args.model_test:
         if args.mjcf is None or args.mujoco_root is not None:
-            parser.error("--getup-mimic requires --mjcf and runs independently of --mujoco-root")
+            parser.error("--getup-mimic and --model_test require --mjcf and run independently of --mujoco-root")
         if args.domain != 1 or args.terrain != "original" or args.depth_preview:
             parser.error("DDS domain, terrain generation and depth preview require --mujoco-root")
         if args.interactive and args.headless:
@@ -55,8 +62,9 @@ def main():
                 select_window_backend(args.window_backend)
             from getup_mimic_sim import run
 
-            return run(PROJECT_ROOT, args.mjcf, args.pose or "all", args.headless, args.follow,
-                       args.interactive, args.hardware_config, args.monitor)
+            expert = (args.expert or "faceup") if args.model_test else None
+            return run(PROJECT_ROOT, args.mjcf, args.pose, args.headless, args.follow,
+                       args.interactive, args.hardware_config, args.monitor, expert=expert)
         except ModuleNotFoundError as error:
             parser.exit(1, f"GetUpMimic requires a Python environment with MuJoCo and NumPy: {error}\n")
         except (KeyError, OSError, RuntimeError, ValueError) as error:
@@ -65,7 +73,7 @@ def main():
             parser.exit(130, "GetUpMimic interrupted\n")
     if (args.mjcf is not None or args.pose is not None or args.headless or args.interactive
             or args.hardware_config or args.monitor is not None):
-        parser.error("GetUpMimic simulation options require --getup-mimic")
+        parser.error("Get-up simulation options require --getup-mimic or --model_test")
     if args.mujoco_root is None:
         parser.error("--mujoco-root is required for the DDS environment")
     if args.domain <= 0:

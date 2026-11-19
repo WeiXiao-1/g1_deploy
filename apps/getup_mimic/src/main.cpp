@@ -14,6 +14,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 using namespace g1_getup_mimic;
@@ -21,7 +22,7 @@ using namespace g1_getup_mimic;
 constexpr float kTolerance = 3e-4f;
 
 void PrintUsage(const char* program) {
-    std::cout << "Usage: " << program << " check [--config JSON]\n"
+    std::cout << "Usage: " << program << " check [--config JSON] [--expert NAME]\n"
               << "Check GetUpMimic model and joint targets offline.\n"
               << "For MuJoCo, use apps/simulation/sim.py --getup-mimic.\n";
 }
@@ -40,9 +41,8 @@ float CheckJoints(const Joints& actual, const YAML::Node& expected_node, const s
     return max_error;
 }
 
-int CheckPolicy(const std::string& config_path) {
-    const auto config = YAML::LoadFile(config_path);
-    const auto check_path = g1_config::ResolvePath(config_path, config["check_path"].as<std::string>());
+int CheckPolicy(const PolicyConfig& config) {
+    const auto check_path = g1_config::ResolvePath(config.path, config.model["check_path"].as<std::string>());
     const auto checks = YAML::LoadFile(check_path);
     const auto parity = checks["parity"];
     const auto sequences = checks["sequences"];
@@ -50,11 +50,11 @@ int CheckPolicy(const std::string& config_path) {
         throw std::runtime_error("GetUpMimic check requires model parity samples and state sequences");
     }
 
-    Policy policy(config_path);
+    Policy policy(config);
     float parity_error = 0;
     for (std::size_t sample = 0; sample < parity.size(); ++sample) {
-        auto observation = g1_config::ReadArray<float, kObservationSize>(parity[sample]["obs"]);
-        const auto error = CheckJoints(policy.Predict(observation), parity[sample]["actions"],
+        auto observation = parity[sample]["obs"].as<std::vector<float>>();
+        const auto error = CheckJoints(policy.Predict(observation.data(), observation.size()), parity[sample]["actions"],
                                        "ONNX parity sample " + std::to_string(sample));
         parity_error = std::max(parity_error, error);
     }
@@ -63,8 +63,9 @@ int CheckPolicy(const std::string& config_path) {
     for (const auto& sequence : sequences) {
         const auto label = sequence["name"].as<std::string>();
         const auto steps = sequence["steps"];
-        if (!steps.IsSequence() || steps.size() <= kHistoryFrames) {
-            throw std::runtime_error(label + " must exercise a full history window and its rollover");
+        const std::size_t minimum_steps = config.observation_size == kObservationSize ? kHistoryFrames + 1 : 2;
+        if (!steps.IsSequence() || steps.size() < minimum_steps) {
+            throw std::runtime_error(label + " needs at least " + std::to_string(minimum_steps) + " consecutive steps");
         }
         policy.Reset();
         float target_error = 0;
@@ -122,8 +123,8 @@ void WriteJointNames() {
 }
 
 // The simulator owns the clock. Names in the handshake specify the wire order.
-int RunSimulationStream(const std::string& config_path) {
-    Policy policy(config_path);
+int RunSimulationStream(const PolicyConfig& config) {
+    Policy policy(config);
     std::cout << "g1-getup-mimic-v1 " << kPolicyPeriod.count();
     WriteJointNames();
 
@@ -152,9 +153,9 @@ int RunSimulationStream(const std::string& config_path) {
     return 0;
 }
 
-int RunHardwareSimulationStream(const std::string& config_path) {
-    const HardwareSettings settings(YAML::LoadFile(config_path));
-    Policy policy(config_path);
+int RunHardwareSimulationStream(const PolicyConfig& config) {
+    const HardwareSettings settings(config.root);
+    Policy policy(config);
     constexpr auto control_period = g1_control::kControlPeriod;
     static_assert(kPolicyPeriod % control_period == std::chrono::milliseconds::zero());
     constexpr auto steps_per_inference = kPolicyPeriod / control_period;
@@ -200,6 +201,7 @@ int RunHardwareSimulationStream(const std::string& config_path) {
         try {
             CheckMeasuredPositions(settings, state);
             if (command == "check") {
+                ProjectedGravity(state.pelvis_quaternion);  // Validate the simulated IMU quaternion.
                 std::cout << (ReadyToGetUp(settings, state) ? "ready" : "unready") << std::endl;
                 continue;
             }
@@ -207,7 +209,6 @@ int RunHardwareSimulationStream(const std::string& config_path) {
             const MotorTargets* active_targets = nullptr;
             float weight = 0.f;
             if (command == "getup") {
-                progress.CheckTilt(settings, state);
                 const double elapsed = std::chrono::duration<double>(control_period * tick).count();
                 const auto status = progress.Update(settings, state, elapsed);
                 if (status == RecoveryProgress::Status::TimedOut) {
@@ -245,19 +246,28 @@ int main(int argc, char** argv) {
         if (mode != "check" && mode != "sim-stream" && mode != "sim-hardware-stream") {
             throw std::invalid_argument("Expected GetUpMimic subcommand check");
         }
-        std::string config = G1_GETUP_MIMIC_DEFAULT_CONFIG;
+        std::string config_path = G1_GETUP_MIMIC_DEFAULT_CONFIG;
+        std::string expert;
         for (int i = 2; i < argc; ++i) {
             const std::string option = argv[i];
             if (option == "--help") {
                 PrintUsage(argv[0]);
                 return 0;
             }
-            if (option != "--config") {
+            if (option == "--config") {
+                config_path = g1_control::OptionValue(argc, argv, i, option);
+            } else if (option == "--expert") {
+                expert = g1_control::OptionValue(argc, argv, i, option);
+                if (expert.empty()) throw std::invalid_argument("Expected a model_test expert name");
+            } else {
                 throw std::invalid_argument("Unknown option: " + option);
             }
-            config = g1_control::OptionValue(argc, argv, i, option);
         }
-        if (mode == "check") return CheckPolicy(config);
+        const PolicyConfig config(config_path, expert);
+        if (mode == "check") {
+            if (!expert.empty()) std::cout << "model_test expert " << expert << '\n';
+            return CheckPolicy(config);
+        }
         if (mode == "sim-hardware-stream") return RunHardwareSimulationStream(config);
         return RunSimulationStream(config);
     } catch (const std::exception& error) {

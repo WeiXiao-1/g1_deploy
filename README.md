@@ -79,7 +79,7 @@ python3 apps/simulation/sim.py --getup-mimic --mjcf /path/to/g1.xml --pose backu
 
 #### 按实机配置仿真
 
-`--hardware-config` 使用同一份 `g1_getup_mimic.json` 和实机控制器的 C++ 力矩计算、限位、起身入口和站稳判据。MuJoCo 每 2 ms 推进一步并更新力矩，ONNX 仍每 10 ms 推理一次。目标角先按关节范围裁剪，随后计算 PD 和裁剪力矩，关节到达限位时屏蔽朝外的力矩。超过实测关节容差或站稳后倾斜过大时触发保护。起身超时则回到阻尼待命。
+`--hardware-config` 使用同一份 `g1_getup_mimic.json` 和实机控制器的 C++ 力矩计算、限位、起身入口和站稳判据。MuJoCo 每 2 ms 推进一步并更新力矩，ONNX 仍每 10 ms 推理一次。目标角先按关节范围裁剪，随后计算 PD 和裁剪力矩，关节到达限位时屏蔽朝外的力矩。实测关节角超过限位及其容差时触发保护。起身超时则回到阻尼待命。
 
 ```bash
 python3 apps/simulation/sim.py --getup-mimic --mjcf /path/to/g1.xml --hardware-config --interactive --follow
@@ -88,7 +88,7 @@ python3 apps/simulation/sim.py --getup-mimic --mjcf /path/to/g1.xml --hardware-c
 
 窗口模式沿用 `9 → P` 和空格。保护触发后先模拟一小段驱动侧阻尼，再进入脱力，按 `R` 或 `N` 重新开始。批量模式先脱力落稳 2 秒，再阻尼待命 0.5 秒，随后从当时的姿态起身。`controller standing` 是实机判据首次成立的时刻，`final stand` 是 MuJoCo 按骨盆高度和直立姿态计算的最终连续站立时长。批量用例要求两项都通过。
 
-此模式在仿真时间中同步运行推理与物理，覆盖可由关节状态和 IMU 姿态决定的保护。DDS 掉包、推理实际耗时超限、驱动响应、温度和电机故障仍需在实机链路上验证。
+此模式在仿真时间中同步运行推理与物理，覆盖静止检查、关节限位、站稳判定和起身超时。DDS 掉包、推理实际耗时超限、驱动响应、温度和电机故障仍需在实机链路上验证。
 
 ### GetUpMimic 实机
 
@@ -103,16 +103,30 @@ cmake --build build -j4
 ```
 
 将 `eth0` 换为与控制板相连的网卡，实机固定使用 DDS 域 0。
-`read-only` 检查 `LowState` 完整性、电机和关节范围，并显示骨盆重力方向与当前姿态是否满足起身入口条件。
+`read-only` 检查 `LowState` 完整性、电机和关节范围，并显示骨盆重力方向及关节速度和角速度是否满足静止条件。
 `real` 启动后处于空跑，按 `P` 或遥控器 `X` 可预览策略目标，终端按秒报告推理耗时峰值。空跑目标发布到 `rt/g1/dry_run_target`。
 
 完成机型对应的低层调试准备后，模拟按键对应关系为 `9` / `Start` 接管、`P` / `X` 起身、空格 / `Select` 停止。
-接管要求摇杆回中和静止的俯卧或仰卧姿态。接管完成后先进入阻尼待命，再次按 `P` / `X` 从最新实测姿态启动起身。
+接管和起身要求摇杆回中、关节速度和骨盆角速度低于静止阈值。接管完成后先进入阻尼待命，再次按 `P` / `X` 从最新实测姿态启动起身。实机与 `--hardware-config` 仿真的入口均接受任意初始骨盆角度。
 策略周期为 10 ms，机载控制循环按 2 ms 调度。控制器在机载侧计算 PD 并将裁剪后的总力矩放入 `LowCmd.tau`，位置增益和速度增益字段置零，渐入时长为 180 ms。
-关节限位和力矩上限按 DDS 电机顺序配置。目标角按限位夹紧，实测超过限位及其容差时会停止。站立阶段以骨盆姿态、角速度和膝关节状态连续满足 1 秒为判据。起身 15 秒未达到判据时退回阻尼待命。
+关节限位和力矩上限按 DDS 电机顺序配置。目标角按限位夹紧，实测超过限位及其容差时会停止。站稳判据要求骨盆姿态、角速度和膝关节状态连续满足 1 秒。起身 15 秒未达到判据时退回阻尼待命。实机与仿真均关闭站稳后的倾斜停机。
 
 手动停止会停止策略、发送零力矩命令并退出。状态失效、推理超时或电机异常时使用驱动侧阻尼退出。检测到竞争发布者时释放本程序的发送端。
 这些是软件控制行为。首次实机验收需核对对应机型的关节范围、力矩字段行为和停止响应，并按该机的低层开发文档开展有现场保护的试验。
+
+### `model_test` 起身专家
+
+`model_test` 复用 GetUpMimic 控制器，按启动时指定的专家运行单帧 93 维策略。`faceup` 是默认的仰卧专家 `model_9000`，`backup` 对应俯卧专家 `model_40000`。专家和动作裁剪参数位于 `g1_getup_mimic.json` 的 `model_test` 段。ONNX 内含观测归一化，运行时从实时状态组装输入，参考轨迹用于训练和回放对照。
+
+```bash
+./g1 model_test check
+./g1 model_test check --expert backup
+python3 apps/simulation/sim.py --model_test --expert backup --mjcf /path/to/g1.xml --hardware-config --headless
+./g1 model_test read-only eth0 --expert backup
+./g1 model_test real eth0 --expert backup
+```
+
+仿真默认运行所选专家对应的三组预设。`real` 启动后先空跑。整个进程使用启动时 `--expert` 指定的专家。
 
 ### StableMimic 离线检查和 MuJoCo 回放
 
@@ -344,6 +358,8 @@ python3 apps/monitor/joint_monitor.py --domain 0 --interface eth0 --host 0.0.0.0
 
 浏览器打开 `http://机器人IP:8765/`（本机仿真用 `http://127.0.0.1:8765/`）。网页显示 29 关节状态、IMU、真实命令及空跑目标，过期数据显示离线；网页不能发送运动命令，Ctrl+C 结束服务。
 安装后使用 `./g1 monitor eth0 0.0.0.0 8765`。包装脚本省略监听地址和端口时，默认 `127.0.0.1:8765`。
+
+先启动监控后端，再启动控制程序。后端自动保存每次运行的 29 个关节数据，实机默认采样上限为 250 Hz。网页顶部可以选择历史运行、拖动时间轴查看曲线，或下载整次运行的 CSV。数据库位置和采样参数见 [网页监控说明](docs/WEB.md#运行记录)。
 
 GetUpMimic 和 StableMimic 的独立 MuJoCo 窗口也可使用同一网页。在 GetUpMimic 的 `--hardware-config --interactive` 或 StableMimic 的 `--hardware-config --viewer` 命令后加 `--monitor 8767`，再用本机浏览器打开 `http://127.0.0.1:8767/`。省略端口时，`--monitor` 默认使用 8765。仿真直接给网页提供关节反馈和 C++ 控制器目标，无需另启 DDS 监控服务。按键继续在 MuJoCo 窗口操作。关闭窗口时，关联的网页服务随仿真退出。
 

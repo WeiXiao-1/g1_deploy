@@ -172,12 +172,12 @@ private:
         if (monitor_->Conflict()) throw std::runtime_error("Competing LowCmd publisher");
         g1_hardware::CheckMotorHealth(source, settings_.limits.temperature);
         CheckMeasuredPositions(settings_, state);
-        progress_.CheckTilt(settings_, state);
     }
 
     void TakeOver(Snapshot& snapshot) {
-        if (!g1_control::InputReady(&remote_.state) || !ReadyToGetUp(settings_, ReadPolicyState(snapshot.value))) {
-            log_.Line() << "Takeover requires centered sticks and a resting prone/supine pose.\n";
+        if (!g1_control::InputReady(&remote_.state) ||
+            !ReadyToGetUp(settings_, ReadPolicyState(snapshot.value))) {
+            log_.Line() << "Takeover requires centered sticks and a resting robot.\n";
             return;
         }
         g1_hardware::CheckMotorHealth(snapshot.value, settings_.limits.temperature);
@@ -210,7 +210,7 @@ private:
 
     void Begin(const State& state) {
         if (armed_ && (!g1_control::InputReady(&remote_.state) || !ReadyToGetUp(settings_, state))) {
-            log_.Line() << "Get-up requires centered sticks and a resting prone/supine pose.\n";
+            log_.Line() << "Get-up requires centered sticks and a resting robot.\n";
             return;
         }
         worker_.Begin(true);
@@ -268,7 +268,7 @@ private:
             log_.Line() << "Standing. GetUpMimic remains active.\n";
         } else if (status == RecoveryProgress::Status::TimedOut) {
             HaltPolicy();
-            log_.Line() << "Get-up timed out. Damping only. P/X retries from a resting fallen pose.\n";
+            log_.Line() << "Get-up timed out. Damping only. P/X retries once the robot has settled.\n";
         }
     }
 
@@ -321,7 +321,7 @@ private:
 int main(int argc, char** argv) {
     try {
         if (argc == 1 || std::string(argv[1]) == "--help") {
-            std::cout << "Usage: g1_getup_mimic_real {read-only|real} ROBOT_INTERFACE [--config JSON]\n";
+            std::cout << "Usage: g1_getup_mimic_real {read-only|real} ROBOT_INTERFACE [--config JSON] [--expert NAME]\n";
             return 0;
         }
         const std::string mode = argv[1];
@@ -330,12 +330,21 @@ int main(int argc, char** argv) {
         }
         g1_control::RuntimeOptions options{true, 0, argv[2], G1_GETUP_MIMIC_DEFAULT_CONFIG};
         g1_control::ValidateRuntimeOptions(options);
+        std::string expert;
         for (int i = 3; i < argc; ++i) {
             const std::string key = argv[i];
-            if (key != "--config") throw std::invalid_argument("Unknown option: " + key);
-            options.config = g1_control::OptionValue(argc, argv, i, key);
+            if (key == "--config") {
+                options.config = g1_control::OptionValue(argc, argv, i, key);
+            } else if (key == "--expert") {
+                expert = g1_control::OptionValue(argc, argv, i, key);
+                if (expert.empty()) throw std::invalid_argument("Expected a model_test expert name");
+            } else {
+                throw std::invalid_argument("Unknown option: " + key);
+            }
         }
-        const HardwareSettings settings(YAML::LoadFile(options.config));
+        const PolicyConfig config(options.config, expert);
+        const HardwareSettings settings(config.root);
+        if (!expert.empty()) std::cout << "model_test expert " << expert << std::endl;
         g1_control::InstallSignalHandlers();
         unitree::robot::ChannelFactory::Instance()->Init(options.domain, options.interface);
         std::atomic<bool> armed{false}, remote_stop{false};
@@ -350,10 +359,11 @@ int main(int argc, char** argv) {
             CheckMeasuredPositions(settings, state);
             const auto gravity = ProjectedGravity(state.pelvis_quaternion);
             std::cout << "GetUpMimic read-only OK. Pelvis gravity [" << gravity[0] << ", " << gravity[1]
-                      << ", " << gravity[2] << "]. Resting fallen pose: " << (ReadyToGetUp(settings, state) ? "yes" : "no") << '\n';
+                      << ", " << gravity[2] << "]. Resting: "
+                      << (ReadyToGetUp(settings, state) ? "yes" : "no") << '\n';
             return 0;
         }
-        Policy policy(options.config);
+        Policy policy(config);
         policy.Step(state);  // Warm the model without allowing motor output.
         policy.Reset();
         return RealController(settings, receiver, policy, armed, remote_stop).Run();

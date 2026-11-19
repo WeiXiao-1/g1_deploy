@@ -65,6 +65,14 @@ The nominal torque caps are the lower of the URDF effort limit and the
 corresponding training effort limit. URDF SHA256
 `f055210bb33df3513a639573c6886ebd18f52fc70b507ef18930b51efb82cf2e`.
 
+The `model_test` ONNX files are byte-for-byte copies from
+`diffusion_lab/getup_mimic/expert_policy`. Each single-frame actor embeds its
+own observation normalizer. Training references in `expert_motion` are
+`face-up2-gmr-contact-v3.npz` for `face-up/model_9000.onnx` and `backup-edited-v3.npz`
+for `back-up/model_40000.onnx`.
+The expert check fixtures use the source PyTorch checkpoints for expected raw
+actions and DDS targets, including a synthetic sequence for clipping and feedback.
+
 StableMimic model `apps/stablemimic/models/model_34500.onnx`
 has SHA256 `774139512ab9ea362b7c2be3daa7e241166aaf28d6139ef15230bad963a72e4a`.
 It is a byte-for-byte copy of `exported/model_34500.onnx` from the local StableMimic

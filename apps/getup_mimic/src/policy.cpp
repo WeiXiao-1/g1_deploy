@@ -21,8 +21,25 @@ bool SupportsSingleBatch(const std::vector<int64_t>& shape, int features) {
 
 }  // namespace
 
-Policy::Policy(const std::string& config_path) {
-    const auto config = YAML::LoadFile(config_path);
+PolicyConfig::PolicyConfig(const std::string& config_path, const std::string& expert)
+    : path(config_path), root(YAML::LoadFile(path)), model(root) {
+    if (expert.empty()) return;
+
+    const auto experts = root["model_test"];
+    const auto selected = experts && experts.IsMap() ? experts[expert] : YAML::Node{};
+    if (!selected || !selected.IsMap()) throw std::invalid_argument("Unknown model_test expert: " + expert);
+    model.reset(selected);
+    observation_size = kFrameSize;
+
+    action_clip = selected["action_clip"].as<float>();
+    if (!std::isfinite(action_clip) || action_clip <= 0.f) {
+        throw std::invalid_argument("Expected a positive finite model_test action_clip for " + expert);
+    }
+}
+
+Policy::Policy(const PolicyConfig& settings)
+    : observation_size_(settings.observation_size), action_clip_(settings.action_clip) {
+    const auto& config = settings.root;
     motor_ids_ = g1_joints::FromNames(config["joint_names"].as<std::vector<std::string>>());
     default_position_ = g1_config::ReadArray<float, kJointCount>(config["default_joint_pos"]);
     action_scale_ = g1_config::ReadArray<float, kJointCount>(config["action_scale"]);
@@ -34,14 +51,15 @@ Policy::Policy(const std::string& config_path) {
         }
     }
 
-    const auto model_path = g1_config::ResolvePath(config_path, config["policy_path"].as<std::string>());
+    const auto model_path = g1_config::ResolvePath(settings.path, settings.model["policy_path"].as<std::string>());
     auto options = g1_onnx::CpuSessionOptions();
     options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
     session_ = std::make_unique<Ort::Session>(env_, model_path.c_str(), options);
     if (session_->GetInputCount() != 1 || session_->GetOutputCount() != 1 ||
-        !SupportsSingleBatch(g1_onnx::TensorShape(*session_, true, 0), kObservationSize) ||
+        !SupportsSingleBatch(g1_onnx::TensorShape(*session_, true, 0), observation_size_) ||
         !SupportsSingleBatch(g1_onnx::TensorShape(*session_, false, 0), kJointCount)) {
-        throw std::runtime_error("Expected GetUpMimic float32 tensors [batch,744] -> [batch,29]");
+        throw std::runtime_error("Expected GetUpMimic float32 tensors [batch," + std::to_string(observation_size_)
+                                 + "] -> [batch,29]");
     }
     input_name_ = g1_onnx::TensorName(*session_, true, 0);
     output_name_ = g1_onnx::TensorName(*session_, false, 0);
@@ -82,26 +100,37 @@ Policy::Frame Policy::BuildFrame(const State& state) const {
         frame[6 + kJointCount + joint] = state.velocity[motor];  // Training default joint velocity is zero.
         frame[6 + 2 * kJointCount + joint] = last_action_[joint];
     }
-    if (std::any_of(frame.begin(), frame.end(), [](float value) { return !std::isfinite(value); })) {
-        throw std::runtime_error("Non-finite GetUpMimic observation");
-    }
     return frame;
 }
 
-Joints Policy::Predict(Observation& observation) {
-    const g1_onnx::InputTensor input{input_name_.c_str(), observation.data(), observation.size(), {1, kObservationSize}};
+Joints Policy::Predict(float* observation, std::size_t size) {
+    if (size != static_cast<std::size_t>(observation_size_)) {
+        throw std::runtime_error("Invalid GetUpMimic observation size; expected " + std::to_string(observation_size_));
+    }
+    if (std::any_of(observation, observation + size, [](float value) { return !std::isfinite(value); })) {
+        throw std::runtime_error("Non-finite GetUpMimic observation");
+    }
+    const g1_onnx::InputTensor input{input_name_.c_str(), observation, size, {1, observation_size_}};
     return g1_onnx::Run<kJointCount>(*session_, {input}, output_name_);
 }
 
 MotorTargets Policy::Step(const State& state) {
     auto next_history = history_;
     bool next_history_ready = history_ready_;
-    g1_inference::PushHistory(next_history, BuildFrame(state), next_history_ready);
-    Observation observation{};
-    g1_inference::PackTermMajor(next_history, kTermSizes, observation.begin());
+    auto frame = BuildFrame(state);
+    Observation history_observation;
+    float* observation = frame.data();
+    if (observation_size_ == kObservationSize) {
+        g1_inference::PushHistory(next_history, frame, next_history_ready);
+        g1_inference::PackTermMajor(next_history, kTermSizes, history_observation.begin());
+        observation = history_observation.data();
+    }
 
-    // The export includes normalization and raw action clipping. Feed back the model action.
-    const auto action = Predict(observation);
+    // The history model clips inside ONNX. Expert exports return raw actor actions.
+    auto action = Predict(observation, observation_size_);
+    if (action_clip_ > 0.f) {
+        for (float& value : action) value = std::clamp(value, -action_clip_, action_clip_);
+    }
     MotorTargets result{{}, motor_kp_, motor_kd_};
     for (int joint = 0; joint < kJointCount; ++joint) {
         const float position = default_position_[joint] + action_scale_[joint] * action[joint];

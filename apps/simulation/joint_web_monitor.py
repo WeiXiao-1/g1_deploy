@@ -20,7 +20,7 @@ class SimulationMonitor:
         self.torso = model.body("torso_link").id
         self.force_field = force_field
         self.read_targets = read_targets
-        self.server = JointMonitor("127.0.0.1", port)
+        self.server = JointMonitor("127.0.0.1", port, record_rate=50, source=f"MuJoCo · {controller}")
         if tuple(names) != tuple(self.server.names):
             self.server.close()
             raise RuntimeError("Unexpected DDS joint order for the MuJoCo web monitor")
@@ -62,8 +62,11 @@ class SimulationMonitor:
                                kp=kp, kd=kd, error=goal-q, target_available=target is not None, enabled=enabled,
                                active=enabled and (tau != 0.0 or kp != 0.0 or kd != 0.0)))
         self.server.on_torso_imu(self.imu(data, self.torso))
-        self.server.publish_snapshot(dict(joints=joints, simulation_time=float(data.time), output_enabled=enabled,
-                                          dry_run=False, imu=read_imu_state(self.imu(data, self.pelvis)),
-                                          simulation=dict(controller=self.controller, phase=phase, fault=fault)), now)
+        state = dict(joints=joints, simulation_time=float(data.time), output_enabled=enabled,
+                     dry_run=False, imu=read_imu_state(self.imu(data, self.pelvis)),
+                     simulation=dict(controller=self.controller, phase=phase, fault=fault),
+                     target_source="simulation" if target is not None else None)
+        self.server.publish_snapshot(state, now)
+        self.server.record_simulation(state, now)
         self.next_sample = now + self.server.period
         self.last_phase = phase

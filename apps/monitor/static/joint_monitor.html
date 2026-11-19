@@ -15,11 +15,18 @@ header{display:flex;justify-content:space-between;align-items:center;gap:20px;fl
 .detail{padding:18px}.detail h2{font-size:15px;word-break:break-all;margin:0 0 8px}label{color:#a3b4cd}canvas{width:100%;height:150px;display:block;margin:8px 0 18px;background:#0b1422;border-radius:8px}.joint-check{width:16px;height:16px;min-width:0;padding:0;flex:none;accent-color:#63ddcc;cursor:pointer}.joint-legend{display:flex;flex-wrap:wrap;gap:8px 14px;margin-bottom:14px;font-size:12px;word-break:break-all}.legend{font-size:12px;color:#91a0b5;margin:10px 0 18px}.measured{color:#63ddcc}.target{color:#fbbf75}.empty{padding:40px;text-align:center;color:#91a0b5}footer{margin-top:18px;color:#77879d;font-size:12px;line-height:1.8}
 .imu-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:20px}.imu-card{padding:16px}.imu-card h2{font-size:14px;color:#a3b4cd;margin:0 0 12px}.imu-vector{display:flex;gap:16px;flex-wrap:wrap}.imu-vector span{color:#91a0b5}.imu-vector b{display:block;margin-top:4px;color:#dce5f1;font-size:17px;font-variant-numeric:tabular-nums}@media(max-width:1000px){.imu-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:500px){.imu-grid{grid-template-columns:1fr}}
 @media(max-width:1000px){.layout{grid-template-columns:1fr}.scroll{max-height:55vh}body{padding:16px}.stats{gap:20px;flex-wrap:wrap}}:focus-visible{outline:2px solid #63ddcc;outline-offset:2px}
-.torso-grid{grid-template-columns:repeat(5,minmax(0,1fr))}@media(max-width:1200px){.torso-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:500px){.torso-grid{grid-template-columns:1fr}}</style>
+.torso-grid{grid-template-columns:repeat(5,minmax(0,1fr))}@media(max-width:1200px){.torso-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:500px){.torso-grid{grid-template-columns:1fr}}
+.recordings{margin-top:20px}.recordings .toolbar{gap:12px}.recordings select{max-width:100%}.recordings p{padding:0 16px 14px}.timeline{display:flex;align-items:center;gap:12px;padding:0 16px 14px;flex-wrap:wrap}.timeline input{padding:0;accent-color:#63ddcc}.timeline output{min-width:100px;font-variant-numeric:tabular-nums}.download{color:#63ddcc;text-underline-offset:3px}[hidden]{display:none!important}button:disabled{cursor:default;opacity:.55}
+</style>
 </head>
 <body>
 <header><div><h1>G1 <span style="color:#63ddcc">/</span> 关节实时监控</h1><p id="source">查看关节状态、跟踪误差与最近 20 秒的变化</p></div><div id="status" class="status" role="status">正在连接…</div></header>
-<div class="stats"><span>控制端 Enable<b id="enable">—</b></span><span>关节数量<b id="count">—</b></span><span>监控时间 / s<b id="time">—</b></span><span>最大跟踪误差<b id="error">—</b></span><span>数据年龄 / ms<b id="age">—</b></span></div>
+<section class="panel recordings" aria-label="运行记录">
+ <div class="toolbar"><select id="run" aria-label="选择运行记录"><option value="">实时监控</option></select><span id="recording" class="status" role="status">正在连接记录服务…</span><a id="download" class="download" hidden>下载 29 关节 CSV</a></div>
+ <div id="timeline" class="timeline" hidden><label for="cursor">运行时间</label><input id="cursor" type="range" min="0" max="0" step="any"><output id="cursorTime" for="cursor"></output><label for="window">曲线范围</label><select id="window"><option value="1">1 秒</option><option value="5" selected>5 秒</option><option value="20">20 秒</option></select></div>
+ <p id="runInfo" hidden></p>
+</section>
+<div class="stats"><span>控制端 Enable<b id="enable">—</b></span><span>关节数量<b id="count">—</b></span><span id="timeLabel">监控时间 / s<b id="time">—</b></span><span>最大跟踪误差<b id="error">—</b></span><span>数据年龄 / ms<b id="age">—</b></span></div>
 <h2 style="font-size:18px">Torso IMU · 躯干 <span id="torso-status" class="status">等待数据</span></h2><p id="torso-source" style="margin-bottom:14px">来源 rt/secondary_imu · 超过 100 ms 标记过期</p><section class="imu-grid torso-grid" aria-label="Torso IMU 实时读数">
 <div class="panel imu-card"><h2 id="torso-rpy-label">姿态 RPY / rad</h2><div class="imu-vector"><span>Roll<b id="torso-rpy-0">—</b></span><span>Pitch<b id="torso-rpy-1">—</b></span><span>Yaw<b id="torso-rpy-2">—</b></span></div></div>
 <div class="panel imu-card"><h2 id="torso-gyroscope-label">角速度 / rad/s</h2><div class="imu-vector"><span>X<b id="torso-gyroscope-0">—</b></span><span>Y<b id="torso-gyroscope-1">—</b></span><span>Z<b id="torso-gyroscope-2">—</b></span></div></div>
@@ -34,9 +41,9 @@ header{display:flex;justify-content:space-between;align-items:center;gap:20px;fl
 <main class="layout">
 <section class="panel" aria-label="关节数据"><div class="toolbar"><input id="search" placeholder="搜索关节，例如 elbow" aria-label="搜索关节"><select id="unit" aria-label="角度单位"><option value="rad">弧度 rad</option><option value="deg">角度 °</option></select><button id="pause">暂停显示</button></div>
 <div class="scroll"><table><thead><tr><th>绘图</th><th>关节 / DDS ID</th><th>Enable</th><th id="qHead">角度 rad</th><th>目标</th><th>误差</th><th id="vHead">速度 rad/s</th><th>力矩 Nm</th><th>Kp / Kd</th></tr></thead><tbody id="rows"></tbody></table><div id="empty" class="empty">等待机器人数据…</div></div></section>
-<section class="panel detail"><h2 id="selected">勾选关节查看曲线</h2><p id="control">可同时勾选多个关节</p><div id="jointLegend" class="joint-legend"></div><div class="legend">━ 实际值　┄ 同色虚线为目标值</div><label id="angleLabel">角度 / rad</label><canvas id="angle" aria-label="关节角度曲线"></canvas><label id="speedLabel">速度 / rad/s</label><canvas id="speed" aria-label="关节速度曲线"></canvas><label>反馈力矩 / Nm</label><canvas id="torque" aria-label="关节力矩曲线"></canvas></section>
+<section class="panel detail"><h2 id="selected">勾选关节查看曲线</h2><p id="control">可同时勾选多个关节</p><div id="jointLegend" class="joint-legend"></div><div class="legend">━ 实际值　┄ 同色虚线为目标或指令</div><label id="angleLabel">角度 / rad</label><canvas id="angle" aria-label="关节角度曲线"></canvas><label id="speedLabel">速度 / rad/s</label><canvas id="speed" aria-label="关节速度曲线"></canvas><label id="torqueLabel">力矩 / Nm · 反馈与 LowCmd.tau</label><canvas id="torque" aria-label="关节力矩曲线"></canvas></section>
 </main><footer>
-<span id="hardware-help">网页仅用于查看。骨盆和躯干 IMU 分别来自 LowState 与 rt/secondary_imu。力矩是电机反馈，虚线是目标；超过 500 ms 未更新的目标显示为 —。策略按键在控制器终端或遥控器操作。</span>
+<span id="hardware-help">骨盆和躯干 IMU 分别来自 LowState 与 rt/secondary_imu。力矩实线为 tau_est，虚线为下发的 LowCmd.tau。控制器使用驱动侧 PD 时，LowCmd.tau 仅为前馈项。策略按键在控制器终端或遥控器操作。</span>
 <span id="simulation-help" hidden>在 MuJoCo 窗口按 9 接管、P 启动、空格停止。实线是仿真关节反馈，虚线是控制器使用的目标，力矩显示 MuJoCo 实际施加到关节的值。</span>
 </footer>
 <script>
@@ -46,19 +53,23 @@ let latest=null, paused=false, dirty=false, latestReceivedAt=0;
 const selected=new Set(), histories=new Map();
 const rowCache=new Map();
 let rateStarted=performance.now(), rateSamples=0, measuredRate=0, receivedSample=-1;
+let liveSample=null, liveStatus=['正在连接…'], runs=[], replay=null, replayRequest=null, refreshTimer=null;
+let recordingId, replayPoints={};
+const emptyFrame={joints:[],age_ms:null,simulation_time:null};
 const factor=()=>$('unit').value==='deg'?180/Math.PI:1;
 const suffix=()=>$('unit').value==='deg'?'°':'rad';
 const fmt=x=>Number.isFinite(x)?x.toFixed(3):'—';
+const formattedAngle=x=>Number.isFinite(x)?fmt(x*factor()):'—';
 const phaseLabels={off:'脱力',limp:'脱力',ready:'阻尼待命',running:'策略运行',standing:'站稳','fault-damping':'保护阻尼',fault:'保护停止'};
 function status(text,kind=''){ $('status').textContent=text; $('status').className='status '+kind; }
 const jointColor=index=>`hsl(${(index*137.508)%360} 75% 67%)`;
 function selectJoint(name,checked){
  if(checked){selected.add(name);histories.set(name,{points:[],sample:-1});}
  else{selected.delete(name);histories.delete(name);}
- record();render();
+ if(replay)loadReplay();else{record(liveSample);render();}
 }
 function renderTorsoImu(){
- const torso=latest.torso_imu, age=torso?.age_ms===null?null:(torso?.age_ms||0)+performance.now()-latestReceivedAt;
+ const torso=latest.torso_imu, age=torso?.age_ms==null?null:torso.age_ms+(replay?0:performance.now()-latestReceivedAt);
  const fresh=torso?.fresh&&age!==null&&age<100;
  const imu=fresh?torso.data:null;
  const badge=$('torso-status');
@@ -84,23 +95,27 @@ function render(){
  if(!latest)return;
  renderImu();
  renderTorsoImu();
- const joints=latest.joints, f=factor(), sim=latest.simulation;
- $('source').textContent=sim?'MuJoCo · '+sim.controller:'查看关节状态、跟踪误差与最近 20 秒的变化';
+ const joints=latest.joints, sim=latest.simulation;
+ $('source').textContent=replay?'运行记录 · '+replay.source:sim?'MuJoCo · '+sim.controller:'查看关节状态、跟踪误差与最近 20 秒的变化';
  $('torso-source').textContent=sim?'来源 MuJoCo torso_link':'来源 rt/secondary_imu · 超过 100 ms 标记过期';
  $('hardware-help').hidden=Boolean(sim);
  $('simulation-help').hidden=!sim;
  const enable=latest.output_enabled===true?'ON':latest.output_enabled===false?'OFF':'—';
- $('enable').textContent=sim?enable+' · '+phaseLabels[sim.phase]:latest.dry_run?'OFF · 空跑':enable;
+ $('enable').textContent=sim?enable+' · '+(phaseLabels[sim.phase]||sim.phase):latest.dry_run?'OFF · 空跑':enable;
  $('enable').style.color=latest.output_enabled===true?'#6ee7b7':latest.output_enabled===false?'#fbbf75':'#91a0b5';
- $('count').textContent=joints.length; $('time').textContent=fmt(latest.simulation_time);
- $('age').textContent=latest.age_ms===null?'—':Math.round(latest.age_ms);
- const active=joints.filter(j=>j.target_available); $('error').textContent=active.length?fmt(Math.max(...active.map(j=>Math.abs(j.error)))*f)+' '+suffix():'—';
+ $('count').textContent=joints.length; $('time').textContent=fmt(replay?latest.elapsed_s:latest.simulation_time);
+ $('timeLabel').firstChild.nodeValue=replay?'运行时间 / s':'监控时间 / s';
+ $('age').textContent=replay||latest.age_ms==null?'—':Math.round(latest.age_ms);
+ const errors=joints.filter(j=>j.target_available&&Number.isFinite(j.error)).map(j=>Math.abs(j.error));
+ $('error').textContent=errors.length?formattedAngle(Math.max(...errors))+' '+suffix():'—';
  $('qHead').textContent='角度 '+suffix(); $('vHead').textContent='速度 '+suffix()+'/s';
  const query=$('search').value.trim().toLowerCase(), visible=joints.filter(j=>j.name.toLowerCase().includes(query));
+ for(const row of rowCache.values())row.hidden=true;
  for(const joint of joints){
   let row=rowCache.get(joint.name);
   if(!row){
    row=document.createElement('tr');
+   row.dataset.jointId=joint.index;
    const cell=document.createElement('td'),checkbox=document.createElement('input');
    checkbox.type='checkbox';checkbox.className='joint-check';checkbox.setAttribute('aria-label','绘图 '+joint.name);
    checkbox.onchange=()=>selectJoint(joint.name,checkbox.checked);cell.appendChild(checkbox);row.appendChild(cell);
@@ -110,11 +125,11 @@ function render(){
   row.className=selected.has(joint.name)?'selected':'';
   row.children[0].children[0].checked=selected.has(joint.name);
   row.hidden=!joint.name.toLowerCase().includes(query);
-  const values=[joint.name+' / '+joint.index,joint.enabled===true?'ON':joint.enabled===false?'OFF':'—',fmt(joint.q*f),joint.target_available?fmt(joint.q_target*f):'—',joint.target_available?fmt(joint.error*f):'—',fmt(joint.dq*f),fmt(joint.tau),joint.kp+' / '+joint.kd];
+  const values=[joint.name+' / '+joint.index,joint.enabled===true?'ON':joint.enabled===false?'OFF':'—',formattedAngle(joint.q),joint.target_available?formattedAngle(joint.q_target):'—',joint.target_available?formattedAngle(joint.error):'—',formattedAngle(joint.dq),fmt(joint.tau),fmt(joint.kp)+' / '+fmt(joint.kd)];
   values.forEach((value,i)=>{if(row.children[i+1].textContent!==String(value))row.children[i+1].textContent=value;});
   row.children[2].style.color=joint.enabled===true?'#6ee7b7':joint.enabled===false?'#fbbf75':'#91a0b5';
  }
- $('empty').hidden=visible.length>0;$('empty').textContent=joints.length?'没有匹配的关节':'等待机器人数据…';
+ $('empty').hidden=visible.length>0;$('empty').textContent=joints.length?'没有匹配的关节':replay?'此时间范围内没有样本':'等待机器人数据…';
  $('selected').textContent=selected.size?'已勾选 '+selected.size+' 个关节':'勾选关节查看曲线';
  $('control').textContent=selected.size?'各关节使用独立颜色，目标值使用同色虚线':'在左侧勾选一个或多个关节';
  $('jointLegend').replaceChildren();
@@ -122,17 +137,18 @@ function render(){
   const label=document.createElement('span');label.style.color=jointColor(joint.index);label.textContent='━ '+joint.name;$('jointLegend').appendChild(label);
  }
  $('angleLabel').textContent='角度 / '+suffix();$('speedLabel').textContent='速度 / '+suffix()+'/s';
- plot('angle','q','qt');plot('speed','v','vt');plot('torque','tau');
+ $('torqueLabel').textContent=sim?'施加力矩 / Nm':'力矩 / Nm · 反馈与 LowCmd.tau';
+ plot('angle','q','qt');plot('speed','v','vt');plot('torque','tau','tauc');
 }
-function record(){
- if(!latest)return;
- for(const joint of latest.joints){
-  const series=histories.get(joint.name);if(!series||series.sample===latest.sample_id)continue;
-  const t=latest.simulation_time,points=series.points;
+function record(frame){
+ if(!frame)return;
+ for(const joint of frame.joints){
+  const series=histories.get(joint.name);if(!series||series.sample===frame.sample_id)continue;
+  const t=frame.simulation_time,points=series.points;
   if(points.length&&t<points.at(-1).t)points.length=0;
-  points.push({t,q:joint.q,qt:joint.target_available?joint.q_target:null,v:joint.dq,vt:joint.target_available?joint.dq_target:null,tau:joint.tau});
+  points.push({t,q:joint.q,qt:joint.target_available?joint.q_target:null,v:joint.dq,vt:joint.target_available?joint.dq_target:null,tau:joint.tau,tauc:joint.tau_cmd});
   while(points.length&&(points[0].t<t-20||points.length>10000))points.shift();
-  series.sample=latest.sample_id;
+  series.sample=frame.sample_id;
  }
 }
 function clearHistory(){for(const series of histories.values()){series.points=[];series.sample=-1;}}
@@ -140,23 +156,117 @@ function plot(id,key,target){
  const canvas=$(id), scale=window.devicePixelRatio||1, w=canvas.clientWidth,h=150;
  if(canvas.width!==Math.round(w*scale)||canvas.height!==Math.round(h*scale)){canvas.width=Math.round(w*scale);canvas.height=Math.round(h*scale);}
  const ctx=canvas.getContext('2d');ctx.setTransform(scale,0,0,scale,0,0);ctx.clearRect(0,0,w,h);
- const series=latest.joints.filter(j=>selected.has(j.name)).map(j=>({color:jointColor(j.index),points:histories.get(j.name).points})).filter(s=>s.points.length);
- if(!series.length){ctx.fillStyle='#91a0b5';ctx.font='12px system-ui';ctx.fillText('请勾选需要绘图的关节',20,75);return;}
+ const series=latest.joints.filter(j=>selected.has(j.name)).map(j=>({
+  color:jointColor(j.index),points:(replay?replayPoints[j.index]:histories.get(j.name)?.points)||[]
+ })).filter(s=>s.points.length);
+ const message=text=>{ctx.fillStyle='#91a0b5';ctx.font='12px system-ui';ctx.fillText(text,20,75);};
+ if(!series.length){message(selected.size?'此时间范围内没有曲线样本':'请勾选需要绘图的关节');return;}
  const f=key==='tau'?1:factor();let low=Infinity,high=-Infinity;
  for(const s of series)for(const p of s.points)for(const field of target?[key,target]:[key]){
   if(Number.isFinite(p[field])){low=Math.min(low,p[field]*f);high=Math.max(high,p[field]*f);}
  }
+ if(!Number.isFinite(low)){message('此时间范围内没有有效数据');return;}
  const padding=Math.max((high-low)*.15,.01);low-=padding;high+=padding;
- const end=latest.simulation_time,begin=end-20;
- const x=t=>48+(t-begin)/20*(w-62),y=v=>12+(high-v)/(high-low)*(h-36);
+ const end=replay?Number($('cursor').value):latest.simulation_time;
+ const begin=replay?Math.max(0,end-Number($('window').value)):end-20;
+ const x=t=>48+(t-begin)/Math.max(.001,end-begin)*(w-62),y=v=>12+(high-v)/(high-low)*(h-36);
  ctx.font='10px system-ui';ctx.fillStyle='#91a0b5';ctx.strokeStyle='#233047';ctx.lineWidth=1;ctx.setLineDash([]);
  for(let i=0;i<3;i++){const v=low+(high-low)*i/2;ctx.beginPath();ctx.moveTo(46,y(v));ctx.lineTo(w-10,y(v));ctx.stroke();ctx.fillText(v.toFixed(2),3,y(v)+3);}
- ctx.fillText('−20 s',48,h-6);ctx.fillText('现在',w-35,h-6);
- function line(points,field,color,dash){ctx.strokeStyle=color;ctx.setLineDash(dash);ctx.lineWidth=1.6;ctx.beginPath();let started=false;
-  for(const p of points){if(!Number.isFinite(p[field])){started=false;continue;}if(!started){ctx.moveTo(x(p.t),y(p[field]*f));started=true;}else ctx.lineTo(x(p.t),y(p[field]*f));}ctx.stroke();}
+ ctx.fillText(replay?begin.toFixed(2)+' s':'−20 s',48,h-6);
+ ctx.textAlign='right';ctx.fillText(replay?end.toFixed(2)+' s':'现在',w-10,h-6);ctx.textAlign='left';
+ const maxGap=replay?Math.max(.1,4/replay.rate):.25;
+ function line(points,field,color,dash){
+  ctx.strokeStyle=color;ctx.setLineDash(dash);ctx.lineWidth=1.6;ctx.beginPath();
+  let previous=-Infinity;
+  for(const p of points){
+   if(!Number.isFinite(p[field])){previous=-Infinity;continue;}
+   if(p.t-previous>maxGap)ctx.moveTo(x(p.t),y(p[field]*f));else ctx.lineTo(x(p.t),y(p[field]*f));
+   previous=p.t;
+  }
+  ctx.stroke();
+ }
  for(const s of series){line(s.points,key,s.color,[]);if(target)line(s.points,target,s.color,[5,4]);}
 }
-// One persistent connection; ingest every received sample independently of drawing.
+function recordingStatus(data){
+ const badge=$('recording');
+ badge.textContent=data.error?'记录不可用 · '+data.error:data.id?
+  '正在记录 · 最高 '+data.rate+' Hz'+(data.dropped?' · 丢弃 '+data.dropped+' 帧':''):'等待控制器运行';
+ badge.className='status '+(data.error||data.dropped?'bad':data.id?'live':'');
+}
+async function refreshRuns(){
+ try{
+  const reply=await fetch('/api/runs',{cache:'no-store'});
+  if(!reply.ok)throw Error('读取运行列表失败');
+  const result=await reply.json();runs=result.runs;
+  const options=runs.map(run=>{
+   const time=new Date(run.started_ns/1e6).toLocaleString();
+   const state=run.id===result.id?' · 记录中':run.ended_ns===null?' · 结束未标记':'';
+   return new Option(time+' · '+run.source+' · '+(run.duration_us/1e6).toFixed(1)+' s'+state,run.id);
+  });
+  $('run').replaceChildren(new Option('实时监控',''),...options);
+  $('run').value=replay?.id||'';
+  recordingStatus(liveSample?.history||result);
+  if(replay){
+   replay=runs.find(run=>run.id===replay.id)||replay;
+   configureReplay(false);
+  }
+ }catch(error){
+  recordingStatus({error:liveSample?.history?.error||error.message});
+ }
+}
+function configureReplay(startAtEnd){
+ const duration=replay.duration_us/1e6;
+ const cursor=$('cursor'), previous=Number(cursor.value);
+ cursor.max=String(duration);
+ cursor.value=String(startAtEnd?duration:Math.min(previous,duration));
+ cursor.disabled=duration===0;
+ $('download').href='/api/runs/'+replay.id+'/joints.csv';
+ $('cursorTime').textContent=fmt(Number(cursor.value))+' / '+fmt(duration)+' s';
+ const reasons={output_disabled:'输出已停止',signal_timeout:'控制状态已断流',monitor_stopped:'监控已关闭',publisher_changed:'控制器已切换'};
+ $('runInfo').textContent=(reasons[replay.reason]||'')+(replay.dropped?' · 写入队列丢弃 '+replay.dropped+' 帧':'');
+ $('runInfo').hidden=!$('runInfo').textContent;
+}
+async function loadReplay(){
+ if(!replay)return;
+ replayRequest?.abort();
+ const request=new AbortController();replayRequest=request;
+ const indices=Array.from(selected).map(name=>rowCache.get(name)?.dataset.jointId).filter(id=>id!==undefined);
+ const params=new URLSearchParams({end:$('cursor').value,seconds:$('window').value});
+ if(indices.length)params.set('joints',indices.join(','));
+ status('加载记录…');
+ try{
+  const reply=await fetch('/api/runs/'+replay.id+'/window?'+params,{signal:request.signal});
+  if(!reply.ok)throw Error('读取样本失败');
+  const data=await reply.json();
+  if(request.signal.aborted)return;
+  replayPoints=Object.fromEntries(Object.entries(data.points).map(([id,points])=>[
+   id,points.map(([t,q,qt,v,vt,tau,tauc])=>({t,q,qt,v,vt,tau,tauc}))
+  ]));
+  latest=data.snapshot||emptyFrame;dirty=true;
+  status(data.snapshot?'历史回放':'此时间范围内没有样本');
+ }catch(error){
+  if(request.signal.aborted)return;
+  replayPoints={};latest=emptyFrame;dirty=true;status(error.message,'bad');
+ }
+}
+$('run').onchange=()=>{
+ replayRequest?.abort();replayPoints={};
+ replay=runs.find(run=>run.id===$('run').value)||null;
+ $('timeline').hidden=$('download').hidden=!replay;
+ $('pause').disabled=Boolean(replay);
+ if(replay){
+  latest=emptyFrame;dirty=true;
+  configureReplay(true);loadReplay();
+ }else{
+  $('runInfo').hidden=true;latest=liveSample||emptyFrame;dirty=true;
+  latestReceivedAt=performance.now();status(...(paused?['显示已暂停']:liveStatus));
+ }
+};
+$('run').addEventListener('focus',refreshRuns);
+$('cursor').oninput=()=>{$('cursorTime').textContent=fmt(Number($('cursor').value))+' / '+fmt(replay.duration_us/1e6)+' s';};
+$('cursor').onchange=loadReplay;$('window').onchange=loadReplay;
+refreshRuns();
+// Recording is independent of this live connection.
 const stream=new EventSource('/api/stream');
 stream.onmessage=event=>{
  const data=JSON.parse(event.data);
@@ -165,15 +275,32 @@ stream.onmessage=event=>{
  receivedSample=data.sample_id;
  const now=performance.now();
  if(now-rateStarted>=1000){measuredRate=Math.round(rateSamples*1000/(now-rateStarted));rateSamples=0;rateStarted=now;}
- if(!paused){latest=data;latestReceivedAt=performance.now();record();dirty=true;}
- if(paused)status('显示已暂停');else if(!data.joints.length)status('等待关节数据');else if(data.age_ms>1000)status('关节数据未更新','bad');else if(data.simulation?.fault)status(data.simulation.fault,'bad');else status('实时连接 · '+measuredRate+' Hz','live');
+ liveSample=data;
+ if(data.history){
+  recordingStatus(data.history);
+  if(recordingId!==data.history.id){
+   recordingId=data.history.id;
+   clearTimeout(refreshTimer);refreshTimer=setTimeout(refreshRuns,500);
+  }
+ }
+ if(!data.joints.length)liveStatus=['等待关节数据'];
+ else if(data.age_ms>1000)liveStatus=['关节数据未更新','bad'];
+ else if(data.simulation?.fault)liveStatus=[data.simulation.fault,'bad'];
+ else liveStatus=['实时连接 · '+measuredRate+' Hz','live'];
+ if(!paused)record(data);
+ if(!replay&&!paused){latest=data;latestReceivedAt=now;dirty=true;}
+ if(!replay)status(...(paused?['显示已暂停']:liveStatus));
 };
-stream.onerror=()=>status('连接中断 · 自动重试','bad');
-function draw(){if(dirty){dirty=false;render();}else if(latest&&!paused){renderTorsoImu();}requestAnimationFrame(draw);}
+stream.onerror=()=>{liveStatus=['连接中断 · 自动重试','bad'];if(!replay)status(...liveStatus);};
+function draw(){if(dirty){dirty=false;render();}else if(latest&&!paused&&!replay){renderTorsoImu();}requestAnimationFrame(draw);}
 requestAnimationFrame(draw);
 window.addEventListener('beforeunload',()=>stream.close());
 $('search').oninput=render;$('unit').onchange=render;
-$('pause').onclick=()=>{paused=!paused;$('pause').textContent=paused?'继续显示':'暂停显示';if(!paused)clearHistory();};
+$('pause').onclick=()=>{
+ paused=!paused;$('pause').textContent=paused?'继续显示':'暂停显示';
+ if(!paused){clearHistory();latest=liveSample;latestReceivedAt=performance.now();record(latest);dirty=true;}
+ status(...(paused?['显示已暂停']:liveStatus));
+};
 window.addEventListener('resize',()=>{dirty=true;});
 </script>
 </body>

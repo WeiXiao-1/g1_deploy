@@ -73,7 +73,7 @@ class PolicyStream:
         if reply == "ready":
             return None
         if reply == "unready":
-            return "Wait for a resting prone/supine pose"
+            return "Wait for the robot to settle"
         if reply.startswith("fault "):
             return reply.removeprefix("fault ")
         raise RuntimeError(f"Unexpected hardware entry reply: {reply}")
@@ -93,13 +93,15 @@ class PolicyStream:
 
 
 @contextmanager
-def open_policy(project_root, hardware=False):
+def open_policy(project_root, config, hardware=False, expert=None):
     binary = project_root / "build/g1_getup_mimic"
     if not binary.is_file():
         raise FileNotFoundError(f"Missing {binary}. Build the g1_getup_mimic CMake target first")
-    config = project_root / "apps/getup_mimic/config/g1_getup_mimic.json"
     stream = "sim-hardware-stream" if hardware else "sim-stream"
-    with subprocess.Popen([binary, stream, "--config", config], stdin=subprocess.PIPE,
+    command = [binary, stream, "--config", config]
+    if expert is not None:
+        command.extend(("--expert", expert))
+    with subprocess.Popen(command, stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, encoding="ascii", bufsize=1) as process:
         try:
             yield PolicyStream(process, hardware)
@@ -410,7 +412,7 @@ def open_viewer(stack, simulation, follow, key_callback=None):
     return viewer
 
 
-def run_interactive(simulation, poses, viewer, keys, monitor=None):
+def run_interactive(simulation, poses, viewer, keys, monitor=None, *, label="GetUpMimic"):
     import glfw
 
     pose_index = 0
@@ -425,10 +427,10 @@ def run_interactive(simulation, poses, viewer, keys, monitor=None):
         status = f"{pose['kind']} row={pose['row']} | {message}"
         print(status, flush=True)
         if hasattr(viewer, "set_texts"):
-            text = "\n".join((f"GetUpMimic | {status}", *instructions))
+            text = "\n".join((f"{label} | {status}", *instructions))
             viewer.set_texts((None, None, text, None))
 
-    print("GetUpMimic manual controls | " + " | ".join(instructions), flush=True)
+    print(f"{label} manual controls | " + " | ".join(instructions), flush=True)
     show(limp)
     while viewer.is_running():
         pressed = []
@@ -483,10 +485,21 @@ def run_interactive(simulation, poses, viewer, keys, monitor=None):
     return 0
 
 
-def run(project_root, mjcf, kind, headless, follow, interactive=False, hardware=False, monitor_port=None):
+def run(project_root, mjcf, kind, headless, follow, interactive=False, hardware=False, monitor_port=None,
+        *, expert=None):
     if not mjcf.is_file():
         raise FileNotFoundError(f"MJCF file not found: {mjcf}")
-    settings_path = project_root / "apps/getup_mimic/config/g1_getup_mimic_sim.json"
+    config = project_root / "apps/getup_mimic/config/g1_getup_mimic.json"
+    label = "GetUpMimic"
+    if expert is not None:
+        profiles = json.loads(config.read_text())["model_test"]
+        if expert not in profiles:
+            raise ValueError(f"Unknown model_test expert {expert}. Choose from {', '.join(profiles)}")
+        kind = kind or profiles[expert]["pose"]
+        label = f"model_test {expert}"
+        print(label, flush=True)
+    kind = kind or "all"
+    settings_path = config.with_name("g1_getup_mimic_sim.json")
     settings = json.loads(settings_path.read_text())
     poses = [pose for pose in settings["poses"] if kind == "all" or pose["kind"] == kind]
     if not poses:
@@ -494,7 +507,7 @@ def run(project_root, mjcf, kind, headless, follow, interactive=False, hardware=
 
     passed = 0
     viewer = None
-    with open_policy(project_root, hardware) as policy, ExitStack() as stack:
+    with open_policy(project_root, config, hardware, expert) as policy, ExitStack() as stack:
         simulation = GetUpSimulation(mjcf, settings, policy)
         if hardware:
             print(f"GetUpMimic MuJoCo hardware config | policy {policy.period * 1000:g} ms"
@@ -505,12 +518,12 @@ def run(project_root, mjcf, kind, headless, follow, interactive=False, hardware=
                 from joint_web_monitor import SimulationMonitor
 
                 monitor = stack.enter_context(SimulationMonitor(
-                    monitor_port, "GetUpMimic", simulation.model, policy.joint_names,
+                    monitor_port, label, simulation.model, policy.joint_names,
                     simulation.joint_q, simulation.joint_dq, "qfrc_applied", policy.telemetry))
             simulation.reset(poses[0])
             keys = SimpleQueue()
             viewer = open_viewer(stack, simulation, follow, keys.put)
-            return run_interactive(simulation, poses, viewer, keys, monitor)
+            return run_interactive(simulation, poses, viewer, keys, monitor, label=label)
         if hardware:
             print(f"{len(poses)} cases | limp {AUTO_LIMP_SECONDS:g} s, standby {AUTO_STANDBY_SECONDS:g} s,"
                   f" recovery {policy.timeout:g} s", flush=True)

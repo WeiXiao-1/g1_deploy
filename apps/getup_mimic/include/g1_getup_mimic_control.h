@@ -18,24 +18,22 @@ struct HardwareSettings {
     Joints effort;
     double ramp_seconds;
     double timeout_seconds;
-    double entry_gravity_x;
     double entry_joint_speed;
     double entry_gyro_speed;
     double position_tolerance;
 
     explicit HardwareSettings(const YAML::Node& root)
-        : limits(root), effort(g1_config::ReadArray<float, kJointCount>(root["hardware"]["effort_limit"])),
+        : limits(root, /*use_tilt_limit=*/false),
+          effort(g1_config::ReadArray<float, kJointCount>(root["hardware"]["effort_limit"])),
           ramp_seconds(root["hardware"]["getup_ramp_seconds"].as<double>()),
           timeout_seconds(root["hardware"]["getup_timeout_seconds"].as<double>()),
-          entry_gravity_x(root["hardware"]["entry_min_abs_gravity_x"].as<double>()),
           entry_joint_speed(root["hardware"]["entry_max_joint_speed_rad_s"].as<double>()),
           entry_gyro_speed(root["hardware"]["entry_max_gyro_rad_s"].as<double>()),
           position_tolerance(root["hardware"]["position_tolerance_rad"].as<double>()) {
-        for (double value : {ramp_seconds, timeout_seconds, entry_gravity_x, entry_joint_speed,
-                             entry_gyro_speed, position_tolerance}) {
+        for (double value : {ramp_seconds, timeout_seconds, entry_joint_speed, entry_gyro_speed, position_tolerance}) {
             if (!std::isfinite(value) || value <= 0) throw std::runtime_error("Invalid GetUpMimic hardware setting");
         }
-        if (!limits.limit_target_position || entry_gravity_x > 1 || timeout_seconds <= ramp_seconds ||
+        if (!limits.limit_target_position || timeout_seconds <= ramp_seconds ||
             std::any_of(effort.begin(), effort.end(), [](float value) { return value <= 0; })) {
             throw std::runtime_error("GetUpMimic hardware needs positive effort limits and enabled position limits");
         }
@@ -59,8 +57,7 @@ inline float GyroSpeed(const State& state) {
 }
 
 inline bool ReadyToGetUp(const HardwareSettings& settings, const State& state) {
-    return std::abs(ProjectedGravity(state.pelvis_quaternion)[0]) >= settings.entry_gravity_x &&
-           GyroSpeed(state) <= settings.entry_gyro_speed &&
+    return GyroSpeed(state) <= settings.entry_gyro_speed &&
            std::all_of(state.velocity.begin(), state.velocity.end(),
                        [&](float speed) { return std::abs(speed) <= settings.entry_joint_speed; });
 }
@@ -113,12 +110,6 @@ public:
     void Reset() {
         stable_since_.reset();
         standing_ = false;
-    }
-
-    void CheckTilt(const HardwareSettings& settings, const State& state) const {
-        if (standing_ && -ProjectedGravity(state.pelvis_quaternion)[2] < std::cos(settings.limits.max_tilt)) {
-            throw std::runtime_error("Pelvis tilted after standing");
-        }
     }
 
     Status Update(const HardwareSettings& settings, const State& state, double elapsed_seconds) {

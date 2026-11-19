@@ -35,9 +35,19 @@ install(TARGETS g1_getup_mimic RUNTIME DESTINATION bin)
 install(FILES apps/getup_mimic/config/g1_getup_mimic.json DESTINATION apps/getup_mimic/config)
 install(FILES apps/getup_mimic/models/model_14000.onnx DESTINATION apps/getup_mimic/models)
 install(FILES apps/getup_mimic/checks/model_14000.json DESTINATION apps/getup_mimic/checks)
+install(FILES apps/getup_mimic/models/face-up/model_9000.onnx
+    DESTINATION apps/getup_mimic/models/face-up)
+install(FILES apps/getup_mimic/models/back-up/model_40000.onnx DESTINATION apps/getup_mimic/models/back-up)
+install(FILES apps/getup_mimic/checks/faceup_9000.json apps/getup_mimic/checks/backup_40000.json
+    DESTINATION apps/getup_mimic/checks)
 install(PROGRAMS "${REPOSITORY_ROOT}/g1" DESTINATION .)
 install(FILES "${REPOSITORY_ROOT}/README.md" "${REPOSITORY_ROOT}/ORIGIN.md" DESTINATION .)
 install(FILES "${REPOSITORY_ROOT}/LICENSE" DESTINATION licenses/project)
+install(PROGRAMS apps/monitor/monitor.sh DESTINATION . RENAME monitor)
+install(FILES apps/monitor/joint_monitor.py apps/monitor/run_history.py apps/monitor/requirements.txt
+    DESTINATION apps/monitor)
+install(FILES apps/monitor/static/joint_monitor.html DESTINATION apps/monitor/static)
+install(FILES docs/WEB.md DESTINATION docs)
 # Preserve SONAME symlinks and their targets from the selected native ORT release.
 install(DIRECTORY "${ONNXRUNTIME_ROOT}/lib/" DESTINATION lib
     FILES_MATCHING PATTERN "libonnxruntime.so*" PATTERN "libonnxruntime_providers_shared.so*")
@@ -186,12 +196,8 @@ install(PROGRAMS "${REPOSITORY_ROOT}/apps/parkour/parkour.sh" DESTINATION . RENA
 install(FILES "${REPOSITORY_ROOT}/docs/PARKOUR.md" DESTINATION docs)
 install(FILES "${REPOSITORY_ROOT}/apps/dwaq/models/policy.onnx" DESTINATION apps/dwaq/models)
 install(FILES "${REPOSITORY_ROOT}/apps/dwaq/config/g1_locomotion.json" DESTINATION apps/dwaq/config)
-install(PROGRAMS "${REPOSITORY_ROOT}/apps/monitor/monitor.sh" DESTINATION . RENAME monitor)
-install(FILES "${REPOSITORY_ROOT}/apps/monitor/joint_monitor.py" "${REPOSITORY_ROOT}/apps/monitor/requirements.txt" DESTINATION apps/monitor)
-install(FILES "${REPOSITORY_ROOT}/apps/monitor/static/joint_monitor.html" DESTINATION apps/monitor/static)
 install(FILES "${REPOSITORY_ROOT}/CHANGELOG.md" DESTINATION .)
 install(FILES "${REPOSITORY_ROOT}/docs/HARDWARE.md" DESTINATION docs)
-install(FILES "${REPOSITORY_ROOT}/docs/WEB.md" DESTINATION docs)
 configure_file("${REPOSITORY_ROOT}/cmake/BUILD_INFO.in" "${CMAKE_CURRENT_BINARY_DIR}/BUILD_INFO.txt" @ONLY)
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/BUILD_INFO.txt" DESTINATION .)
 set(CPACK_GENERATOR TGZ)
