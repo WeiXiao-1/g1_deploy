@@ -10,19 +10,33 @@
 #include <cmath>
 #include <optional>
 #include <stdexcept>
+#include <string>
 
 namespace g1_getup_mimic {
+
+enum class ActuationMode { DrivePd, HostTorque };
+
+inline ActuationMode ParseActuationMode(const std::string& name) {
+    if (name == "drive_pd") return ActuationMode::DrivePd;
+    if (name == "host_torque") return ActuationMode::HostTorque;
+    throw std::invalid_argument("GetUpMimic actuation must be drive_pd or host_torque, got " + name);
+}
+
+inline const char* ActuationName(ActuationMode mode) {
+    return mode == ActuationMode::DrivePd ? "drive_pd" : "host_torque";
+}
 
 struct HardwareSettings {
     g1_hardware::LimitsConfig limits;
     Joints effort;
+    ActuationMode actuation = ActuationMode::DrivePd;
     double ramp_seconds;
     double timeout_seconds;
     double entry_joint_speed;
     double entry_gyro_speed;
     double position_tolerance;
 
-    explicit HardwareSettings(const YAML::Node& root)
+    explicit HardwareSettings(const YAML::Node& root, std::optional<ActuationMode> actuation_override = std::nullopt)
         : limits(root, /*use_tilt_limit=*/false),
           effort(g1_config::ReadArray<float, kJointCount>(root["hardware"]["effort_limit"])),
           ramp_seconds(root["hardware"]["getup_ramp_seconds"].as<double>()),
@@ -30,6 +44,9 @@ struct HardwareSettings {
           entry_joint_speed(root["hardware"]["entry_max_joint_speed_rad_s"].as<double>()),
           entry_gyro_speed(root["hardware"]["entry_max_gyro_rad_s"].as<double>()),
           position_tolerance(root["hardware"]["position_tolerance_rad"].as<double>()) {
+        const auto configured_actuation = root["hardware"]["actuation"];
+        if (actuation_override) actuation = *actuation_override;
+        else if (configured_actuation) actuation = ParseActuationMode(configured_actuation.as<std::string>());
         for (double value : {ramp_seconds, timeout_seconds, entry_joint_speed, entry_gyro_speed, position_tolerance}) {
             if (!std::isfinite(value) || value <= 0) throw std::runtime_error("Invalid GetUpMimic hardware setting");
         }
@@ -86,13 +103,19 @@ inline Actuation ComputeActuation(const HardwareSettings& settings, const State&
         const float kp = targets ? weight * targets->kp[joint] : 0.f;
         const float kd = targets ? settings.limits.stop_kd + weight * (targets->kd[joint] - settings.limits.stop_kd)
                                  : settings.limits.stop_kd;
-        float torque = kp * (target - q) - kd * dq;
-        if (!std::isfinite(torque)) throw std::runtime_error("Non-finite GetUpMimic PD torque");
+        const float estimated_torque = kp * (target - q) - kd * dq;
+        if (!std::isfinite(estimated_torque)) throw std::runtime_error("Non-finite GetUpMimic PD torque");
+        float torque = std::clamp(estimated_torque, -settings.effort[joint], settings.effort[joint]);
         if ((q <= low && torque < 0) || (q >= high && torque > 0)) torque = 0;
+        // Scale both gains when the host estimate hits a limit. The drive evaluates PD on its own feedback.
+        float gain_scale = 1.f;
+        if (settings.actuation == ActuationMode::DrivePd && torque != estimated_torque) {
+            gain_scale = torque / estimated_torque;
+        }
         command.applied.position[joint] = target;
-        command.applied.kp[joint] = kp;
-        command.applied.kd[joint] = kd;
-        command.torque[joint] = std::clamp(torque, -settings.effort[joint], settings.effort[joint]);
+        command.applied.kp[joint] = kp * gain_scale;
+        command.applied.kd[joint] = kd * gain_scale;
+        command.torque[joint] = torque;
     }
     return command;
 }

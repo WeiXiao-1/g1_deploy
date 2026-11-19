@@ -79,7 +79,7 @@ python3 apps/simulation/sim.py --getup-mimic --mjcf /path/to/g1.xml --pose backu
 
 #### 按实机配置仿真
 
-`--hardware-config` 使用同一份 `g1_getup_mimic.json` 和实机控制器的 C++ 力矩计算、限位、起身入口和站稳判据。MuJoCo 每 2 ms 推进一步并更新力矩，ONNX 仍每 10 ms 推理一次。目标角先按关节范围裁剪，随后计算 PD 和裁剪力矩，关节到达限位时屏蔽朝外的力矩。实测关节角超过限位及其容差时触发保护。起身超时则回到阻尼待命。
+`--hardware-config` 与实机共用 `g1_getup_mimic.json`、目标处理、限位、起身入口和站稳判据。MuJoCo 每 2 ms 推进一步，ONNX 每 10 ms 推理一次。默认 `drive_pd` 由物理侧用当前关节状态计算 PD，并按 `effort_limit` 裁剪模拟力矩。`--actuation host_torque` 使用 C++ 算出的限幅力矩做对照。实测关节角超过限位及其容差时触发保护。起身超时则回到阻尼待命。
 
 ```bash
 python3 apps/simulation/sim.py --getup-mimic --mjcf /path/to/g1.xml --hardware-config --interactive --follow
@@ -108,10 +108,10 @@ cmake --build build -j4
 
 完成机型对应的低层调试准备后，模拟按键对应关系为 `9` / `Start` 接管、`P` / `X` 起身、空格 / `Select` 停止。
 接管和起身要求摇杆回中、关节速度和骨盆角速度低于静止阈值。接管完成后先进入阻尼待命，再次按 `P` / `X` 从最新实测姿态启动起身。实机与 `--hardware-config` 仿真的入口均接受任意初始骨盆角度。
-策略周期为 10 ms，机载控制循环按 2 ms 调度。控制器在机载侧计算 PD 并将裁剪后的总力矩放入 `LowCmd.tau`，位置增益和速度增益字段置零，渐入时长为 180 ms。
-关节限位和力矩上限按 DDS 电机顺序配置。目标角按限位夹紧，实测超过限位及其容差时会停止。站稳判据要求骨盆姿态、角速度和膝关节状态连续满足 1 秒。起身 15 秒未达到判据时退回阻尼待命。实机与仿真均关闭站稳后的倾斜停机。
+策略周期为 10 ms，机载控制循环按 2 ms 调度。单次推理超过 10 ms 时只记录耗时。配置的 `hardware.actuation` 默认是 `drive_pd`，向驱动下发目标角和 PD 增益，`LowCmd.tau` 为零前馈。以 `--actuation host_torque` 启动时，由机载程序计算 PD，将裁剪后的总力矩放入 `LowCmd.tau`。两种模式均在首个策略结果到达后用 180 ms 渐入。
+关节限位和力矩上限按 DDS 电机顺序配置。两种模式都裁剪目标角，实测超过限位及其容差时会停止。`drive_pd` 按主机反馈估算力矩，触及配置上限时同比降低 `Kp/Kd`，在实测边界压制估算出的外向力矩。驱动侧实际总力矩上限由固件决定，`effort_limit` 在此模式下是主机估算的约束。`host_torque` 直接限幅下发力矩。站稳判据要求骨盆姿态、角速度和膝关节状态连续满足 1 秒。起身 15 秒未达到判据时退回阻尼待命。实机与仿真均关闭站稳后的倾斜停机。
 
-手动停止会停止策略、发送零力矩命令并退出。状态失效、推理超时或电机异常时使用驱动侧阻尼退出。检测到竞争发布者时释放本程序的发送端。
+手动停止会停止策略、发送零力矩命令并退出。低层状态失效、策略输入或结果过期、推理异常或电机异常时使用驱动侧阻尼退出。策略首次结果、结果年龄和对应输入的年龄均受 30 ms 看门狗约束。检测到竞争发布者时释放本程序的发送端。
 这些是软件控制行为。首次实机验收需核对对应机型的关节范围、力矩字段行为和停止响应，并按该机的低层开发文档开展有现场保护的试验。
 
 ### `model_test` 起身专家
@@ -121,12 +121,14 @@ cmake --build build -j4
 ```bash
 ./g1 model_test check
 ./g1 model_test check --expert backup
-python3 apps/simulation/sim.py --model_test --expert backup --mjcf /path/to/g1.xml --hardware-config --headless
+python3 apps/simulation/sim.py --model_test --expert backup --mjcf /path/to/g1.xml --headless
+python3 apps/simulation/sim.py --model_test --expert backup --mjcf /path/to/g1.xml --headless --actuation host_torque
 ./g1 model_test read-only eth0 --expert backup
 ./g1 model_test real eth0 --expert backup
+./g1 model_test real eth0 --expert backup --actuation host_torque
 ```
 
-仿真默认运行所选专家对应的三组预设。`real` 启动后先空跑。整个进程使用启动时 `--expert` 指定的专家。
+`model_test` 仿真自动使用实机配置，默认运行所选专家对应的三组预设。`real` 启动后先空跑。整个进程使用启动时指定的专家和执行模式。
 
 ### StableMimic 离线检查和 MuJoCo 回放
 

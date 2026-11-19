@@ -54,6 +54,7 @@ python3 apps/monitor/joint_monitor.py --domain 0 --interface enP8p1s0 \
 
 - 实机后端默认记录上限为 250 Hz，直接启动 Python 时可用 `--record-rate` 调到最高 500 Hz。实际采样率取决于 DDS 收包和系统调度。内嵌 MuJoCo 网页最高 50 Hz。
 - 每帧保存单调递增的运行时间、本机 Unix 时间、关节角度和速度、估计反馈力矩 `tau_est`、目标与增益，以及最新可用的 `LowCmd` 字段和接收年龄。CSV 中的 `tau` 是反馈值，`tau_cmd` 是指令字段，使用驱动侧 PD 时该字段只代表前馈力矩。DDS 状态与命令按监控端接收时间配对，并保存可用的 DDS 源时间戳和指令发布者标识。过期命令和无效测量留空。
+- `model_test` 默认 `drive_pd`，实机对照优先看 CSV 的 `tau` 和 `kp_cmd/kd_cmd`，`tau_cmd` 为零前馈。使用 `--actuation host_torque` 时，`tau_cmd` 记录机载程序下发的限幅力矩。MuJoCo 的 `tau` 是模拟施加的力矩，运行名称包含所选执行模式。
 - 数据库默认位于 `$XDG_STATE_HOME/g1_deploy/joint_runs.sqlite3`，未设置时使用 `~/.local/state/g1_deploy/joint_runs.sqlite3`。可用环境变量 `G1_JOINT_HISTORY` 或 Python 参数 `--history-db` 自定义路径。监控重启后仍可查看原有记录，磁盘占用随保存的运行增加。
 
 ## 安装目录

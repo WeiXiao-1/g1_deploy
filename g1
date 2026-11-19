@@ -21,7 +21,7 @@ Usage:
   ./g1 getup-mimic read-only INTERFACE     Inspect GetUpMimic hardware state
   ./g1 getup-mimic real INTERFACE          GetUpMimic hardware control, starts in dry run
   ./g1 model_test check [--expert NAME]   Offline single-frame get-up expert checks
-  ./g1 model_test read-only|real INTERFACE [--expert NAME]
+  ./g1 model_test read-only|real INTERFACE [--expert NAME] [--actuation drive_pd|host_torque]
   ./g1 stablemimic check [--config JSON]   Offline StableMimic reference parity checks
   ./g1 stablemimic read-only INTERFACE     Inspect G1 and StableMimic base estimate
   ./g1 stablemimic real INTERFACE          StableMimic hardware control, starts in dry run
@@ -93,7 +93,7 @@ if [[ "$mode" == getup-mimic || "$mode" == model_test ]]; then
     if [[ "$mode" == model_test ]]; then expert_args=(--expert faceup); fi
     getup_usage() {
         printf '%s\n' "Usage: ./g1 $mode check [--config JSON]" \
-            "       ./g1 $mode read-only|real INTERFACE [--config JSON]"
+            "       ./g1 $mode read-only|real INTERFACE [--config JSON] [--actuation drive_pd|host_torque]"
         if [[ "$mode" == model_test ]]; then
             printf '%s\n' 'Options: --expert faceup|backup (default: faceup)'
         fi

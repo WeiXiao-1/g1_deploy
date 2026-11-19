@@ -27,9 +27,14 @@ class PolicyStream:
     def __init__(self, process, hardware=False):
         self.process = process
         header = self._read().split()
-        name = "g1-getup-mimic-hardware-v1" if hardware else "g1-getup-mimic-v1"
+        name = header[0] if header else ""
+        self.drive_pd = hardware and name == "g1-getup-mimic-drive-pd-v1"
+        expected = ({"g1-getup-mimic-hardware-v1", "g1-getup-mimic-drive-pd-v1"} if hardware
+                    else {"g1-getup-mimic-v1"})
         joint_start = 6 if hardware else 2
-        if len(header) != joint_start + 29 or header[0] != name or len(set(header[joint_start:])) != 29:
+        if self.drive_pd:
+            joint_start += 29  # Drive effort limits, followed by joint names in DDS order.
+        if len(header) != joint_start + 29 or name not in expected or len(set(header[joint_start:])) != 29:
             raise RuntimeError("Unexpected C++ policy handshake. Rebuild g1_getup_mimic")
         self.period = int(header[1]) / 1000
         if self.period != 0.01:
@@ -38,6 +43,10 @@ class PolicyStream:
         self.control_period = int(header[2]) / 1000 if hardware else None
         if hardware:
             self.timeout, self.stop_kd, self.damping_seconds = map(float, header[3:6])
+        if self.drive_pd:
+            self.drive_effort = np.asarray(header[6:joint_start], dtype=np.float64)
+            if not np.isfinite(self.drive_effort).all() or np.any(self.drive_effort <= 0):
+                raise RuntimeError("Invalid simulated drive effort limits")
 
     def _read(self):
         line = self.process.stdout.readline()
@@ -82,18 +91,19 @@ class PolicyStream:
         phase, _, payload = self._send_state(command, observation).partition(" ")
         if phase == "fault":
             return phase, payload
-        torque = np.asarray(payload.split(), dtype=np.float64)
+        values = np.asarray(payload.split(), dtype=np.float64)
+        count = len(self.joint_names) * (3 if self.drive_pd else 1)
         if (phase not in ("damping", "rising", "standing", "timeout")
-                or torque.size != len(self.joint_names) or not np.isfinite(torque).all()):
+                or values.size != count or not np.isfinite(values).all()):
             raise RuntimeError("Invalid GetUpMimic hardware simulation output")
-        return phase, torque
+        return phase, values.reshape(3, -1) if self.drive_pd else values
 
     def telemetry(self):
         return self._request("telemetry").strip()
 
 
 @contextmanager
-def open_policy(project_root, config, hardware=False, expert=None):
+def open_policy(project_root, config, hardware=False, expert=None, *, actuation=None):
     binary = project_root / "build/g1_getup_mimic"
     if not binary.is_file():
         raise FileNotFoundError(f"Missing {binary}. Build the g1_getup_mimic CMake target first")
@@ -101,6 +111,8 @@ def open_policy(project_root, config, hardware=False, expert=None):
     command = [binary, stream, "--config", config]
     if expert is not None:
         command.extend(("--expert", expert))
+    if actuation is not None:
+        command.extend(("--actuation", actuation))
     with subprocess.Popen(command, stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, encoding="ascii", bufsize=1) as process:
         try:
@@ -184,12 +196,14 @@ class GetUpSimulation:
         return height, 1 - 2 * (x * x + y * y)
 
     def advance(self, target=0.0, kp=0.0, kd=0.0):
-        data = self.data
-        expected_time = data.time + self.policy.period
+        expected_time = self.data.time + self.policy.period
         for _ in range(self.substeps):
-            torque = kp * (target - data.qpos[self.joint_q]) - kd * data.qvel[self.joint_dq]
-            self.apply_forces(np.clip(torque, -self.effort_limit, self.effort_limit))
+            self.apply_forces(self.pd_torque(target, kp, kd, self.effort_limit))
         self.check_step(expected_time)
+
+    def pd_torque(self, target, kp, kd, effort_limit):
+        torque = kp * (target - self.data.qpos[self.joint_q]) - kd * self.data.qvel[self.joint_dq]
+        return np.clip(torque, -effort_limit, effort_limit)
 
     def apply_forces(self, torques):
         self.data.qfrc_applied.fill(0)
@@ -299,20 +313,24 @@ class RecoverySession:
         message = None
         if self.phase in ("ready", "running", "standing"):
             command = "damping" if self.phase == "ready" else "getup"
-            status, torque = self.policy.motor_tick(command, sim.observation())
+            status, output = self.policy.motor_tick(command, sim.observation())
             if status == "fault":
-                self.failure = torque
+                self.failure = output
                 self.phase = "fault"
                 self.damping_until = now + self.policy.damping_seconds
                 message = f"Protection stop: {self.failure}. R/N resets the scene"
-            elif status == "timeout":
-                self.phase = "ready"
-                self.failure = "get-up timed out"
-                message = "Get-up timed out. Damping only (P to retry)"
-            elif status == "standing" and self.phase == "running":
-                self.phase = "standing"
-                self.first_stable = now - self.started_at
-                message = f"Standing after {self.first_stable:.2f} s"
+            else:
+                torque = output
+                if self.policy.drive_pd:
+                    torque = sim.pd_torque(*output, effort_limit=self.policy.drive_effort)
+                if status == "timeout":
+                    self.phase = "ready"
+                    self.failure = "get-up timed out"
+                    message = "Get-up timed out. Damping only (P to retry)"
+                elif status == "standing" and self.phase == "running":
+                    self.phase = "standing"
+                    self.first_stable = now - self.started_at
+                    message = f"Standing after {self.first_stable:.2f} s"
         if self.phase == "fault":
             # Approximate the short drive-side damping burst with the simulator's joint velocity.
             torque = -self.policy.stop_kd * sim.data.qvel[sim.joint_dq] if now < self.damping_until else 0.0
@@ -486,7 +504,7 @@ def run_interactive(simulation, poses, viewer, keys, monitor=None, *, label="Get
 
 
 def run(project_root, mjcf, kind, headless, follow, interactive=False, hardware=False, monitor_port=None,
-        *, expert=None):
+        *, expert=None, actuation=None):
     if not mjcf.is_file():
         raise FileNotFoundError(f"MJCF file not found: {mjcf}")
     config = project_root / "apps/getup_mimic/config/g1_getup_mimic.json"
@@ -507,10 +525,12 @@ def run(project_root, mjcf, kind, headless, follow, interactive=False, hardware=
 
     passed = 0
     viewer = None
-    with open_policy(project_root, config, hardware, expert) as policy, ExitStack() as stack:
+    with open_policy(project_root, config, hardware, expert, actuation=actuation) as policy, ExitStack() as stack:
         simulation = GetUpSimulation(mjcf, settings, policy)
         if hardware:
-            print(f"GetUpMimic MuJoCo hardware config | policy {policy.period * 1000:g} ms"
+            mode = "drive_pd" if policy.drive_pd else "host_torque"
+            label = f"{label} · {mode}"
+            print(f"GetUpMimic MuJoCo hardware config | {mode} | policy {policy.period * 1000:g} ms"
                   f" / control and physics {policy.control_period * 1000:g} ms", flush=True)
         if interactive:
             monitor = None

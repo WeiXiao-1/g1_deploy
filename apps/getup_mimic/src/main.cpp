@@ -24,7 +24,7 @@ constexpr float kTolerance = 3e-4f;
 void PrintUsage(const char* program) {
     std::cout << "Usage: " << program << " check [--config JSON] [--expert NAME]\n"
               << "Check GetUpMimic model and joint targets offline.\n"
-              << "For MuJoCo, use apps/simulation/sim.py --getup-mimic.\n";
+              << "For MuJoCo, use apps/simulation/sim.py --model_test [--actuation drive_pd|host_torque].\n";
 }
 
 float CheckJoints(const Joints& actual, const YAML::Node& expected_node, const std::string& label) {
@@ -122,6 +122,16 @@ void WriteJointNames() {
     std::cout << std::endl << std::setprecision(std::numeric_limits<float>::max_digits10);
 }
 
+void WriteJointValues(const Joints& values) {
+    for (float value : values) std::cout << ' ' << value;
+}
+
+void WriteTargets(const MotorTargets& targets) {
+    WriteJointValues(targets.position);
+    WriteJointValues(targets.kp);
+    WriteJointValues(targets.kd);
+}
+
 // The simulator owns the clock. Names in the handshake specify the wire order.
 int RunSimulationStream(const PolicyConfig& config) {
     Policy policy(config);
@@ -142,26 +152,23 @@ int RunSimulationStream(const PolicyConfig& config) {
         if (command != "step") throw std::runtime_error("Unknown GetUpMimic simulation command");
         const auto state = ReadSimulationState(input);
         RequireEndOfCommand(input);
-        const auto targets = policy.Step(state);
-        for (const auto& values : {targets.position, targets.kp, targets.kd}) {
-            for (float value : values) {
-                std::cout << value << ' ';
-            }
-        }
+        WriteTargets(policy.Step(state));
         std::cout << std::endl;
     }
     return 0;
 }
 
-int RunHardwareSimulationStream(const PolicyConfig& config) {
-    const HardwareSettings settings(config.root);
+int RunHardwareSimulationStream(const PolicyConfig& config, std::optional<ActuationMode> actuation_override) {
+    const HardwareSettings settings(config.root, actuation_override);
+    const bool drive_pd = settings.actuation == ActuationMode::DrivePd;
     Policy policy(config);
     constexpr auto control_period = g1_control::kControlPeriod;
     static_assert(kPolicyPeriod % control_period == std::chrono::milliseconds::zero());
     constexpr auto steps_per_inference = kPolicyPeriod / control_period;
-    std::cout << "g1-getup-mimic-hardware-v1 " << kPolicyPeriod.count() << ' ' << control_period.count()
-              << ' ' << settings.timeout_seconds << ' ' << settings.limits.stop_kd
-              << ' ' << settings.limits.damping_seconds;
+    std::cout << (drive_pd ? "g1-getup-mimic-drive-pd-v1 " : "g1-getup-mimic-hardware-v1 ")
+              << kPolicyPeriod.count() << ' ' << control_period.count() << ' ' << settings.timeout_seconds
+              << ' ' << settings.limits.stop_kd << ' ' << settings.limits.damping_seconds;
+    if (drive_pd) WriteJointValues(settings.effort);
     WriteJointNames();
 
     MotorTargets targets{};
@@ -188,8 +195,7 @@ int RunHardwareSimulationStream(const PolicyConfig& config) {
                 std::cout << "none" << std::endl;
                 continue;
             }
-            for (const auto* values : {&telemetry->position, &telemetry->kp, &telemetry->kd})
-                for (float value : *values) std::cout << value << ' ';
+            WriteTargets(*telemetry);
             std::cout << std::endl;
             continue;
         }
@@ -224,7 +230,8 @@ int RunHardwareSimulationStream(const PolicyConfig& config) {
             const auto actuation = ComputeActuation(settings, state, active_targets, weight);
             telemetry = actuation.applied;
             std::cout << phase;
-            for (float torque : actuation.torque) std::cout << ' ' << torque;
+            if (drive_pd) WriteTargets(actuation.applied);
+            else WriteJointValues(actuation.torque);
             std::cout << std::endl;
         } catch (const std::runtime_error& error) {
             telemetry.reset();
@@ -248,6 +255,7 @@ int main(int argc, char** argv) {
         }
         std::string config_path = G1_GETUP_MIMIC_DEFAULT_CONFIG;
         std::string expert;
+        std::optional<ActuationMode> actuation;
         for (int i = 2; i < argc; ++i) {
             const std::string option = argv[i];
             if (option == "--help") {
@@ -259,6 +267,8 @@ int main(int argc, char** argv) {
             } else if (option == "--expert") {
                 expert = g1_control::OptionValue(argc, argv, i, option);
                 if (expert.empty()) throw std::invalid_argument("Expected a model_test expert name");
+            } else if (option == "--actuation" && mode == "sim-hardware-stream") {
+                actuation = ParseActuationMode(g1_control::OptionValue(argc, argv, i, option));
             } else {
                 throw std::invalid_argument("Unknown option: " + option);
             }
@@ -268,7 +278,7 @@ int main(int argc, char** argv) {
             if (!expert.empty()) std::cout << "model_test expert " << expert << '\n';
             return CheckPolicy(config);
         }
-        if (mode == "sim-hardware-stream") return RunHardwareSimulationStream(config);
+        if (mode == "sim-hardware-stream") return RunHardwareSimulationStream(config, actuation);
         return RunSimulationStream(config);
     } catch (const std::exception& error) {
         std::cerr << "Error: " << error.what() << '\n';

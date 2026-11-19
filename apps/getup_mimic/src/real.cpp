@@ -78,20 +78,18 @@ struct Commands {
 Commands BuildCommands(const HardwareSettings& settings, const State& state, std::uint8_t mode_machine,
                        const MotorTargets* targets, float weight) {
     Commands commands{};
-    commands.motor.mode_machine() = commands.monitor.mode_machine() = mode_machine;
-    commands.motor.mode_pr() = commands.monitor.mode_pr() = 0;  // PR coordinates.
+    commands.monitor.mode_machine() = mode_machine;
+    commands.monitor.mode_pr() = 0;  // PR coordinates.
     const auto actuation = ComputeActuation(settings, state, targets, weight);
-    for (int joint = 0; joint < kJointCount; ++joint) {
-        auto& motor = commands.motor.motor_cmd()[joint];
-        motor.mode() = 1;
-        motor.q() = actuation.applied.position[joint];
-        // Evaluate PD on the onboard loop so the torque bound applies to the entire command.
-        motor.tau() = actuation.torque[joint];
-        auto& monitor = commands.monitor.motor_cmd()[joint];
-        monitor = motor;
-        monitor.kp() = actuation.applied.kp[joint];
-        monitor.kd() = actuation.applied.kd[joint];
-        monitor.tau() = 0;  // Telemetry shows the equivalent PD target, not a second torque request.
+    g1_control::SetPositionTargets(commands.monitor, actuation.applied.position,
+                                   actuation.applied.kp, actuation.applied.kd);
+    commands.motor = commands.monitor;
+    if (settings.actuation == ActuationMode::HostTorque) {
+        for (int joint = 0; joint < kJointCount; ++joint) {
+            auto& motor = commands.motor.motor_cmd()[joint];
+            motor.kp() = motor.kd() = 0.f;
+            motor.tau() = actuation.torque[joint];
+        }
     }
     g1_hardware::CheckCommand(commands.motor);
     commands.motor.crc() = g1_hardware::Crc(commands.motor);
@@ -114,10 +112,16 @@ public:
     RealController(const HardwareSettings& settings, const Receiver& receiver, Policy& policy,
                    std::atomic<bool>& armed, const std::atomic<bool>& remote_stop)
         : settings_(settings), receiver_(receiver), armed_(armed), remote_stop_(remote_stop), worker_(
-              [&policy](const PolicyInput& input, const auto&) {
+              [this, &policy](const PolicyInput& input, const auto&) {
                   const auto start = Clock::now();
                   auto targets = policy.Step(input.state);
-                  return TimedTargets{targets, std::chrono::duration<double, std::milli>(Clock::now() - start).count()};
+                  const auto elapsed = Clock::now() - start;
+                  const double milliseconds = std::chrono::duration<double, std::milli>(elapsed).count();
+                  if (elapsed > kPolicyPeriod) {
+                      log_.Line() << "Policy inference took " << milliseconds << " ms, exceeding the "
+                                  << kPolicyPeriod.count() << " ms period.\n";
+                  }
+                  return TimedTargets{targets, milliseconds};
               }, [&policy] { policy.Reset(); }, true, kPolicyPeriod) {}
 
     int Run() {
@@ -213,7 +217,7 @@ private:
             log_.Line() << "Get-up requires centered sticks and a resting robot.\n";
             return;
         }
-        worker_.Begin(true);
+        worker_.Begin(false);
         running_ = true;
         started_ = Clock::now();
         ramp_started_.reset();
@@ -257,7 +261,8 @@ private:
             peak_inference_ms_ = std::max(peak_inference_ms_, latest.target.milliseconds);
         }
         if (now >= next_report_) {
-            log_.Line() << "Policy inference peak " << peak_inference_ms_ << " ms (10 ms period).\n";
+            log_.Line() << "Policy inference peak " << peak_inference_ms_ << " ms ("
+                        << kPolicyPeriod.count() << " ms period).\n";
             peak_inference_ms_ = 0;
             next_report_ = now + std::chrono::seconds(1);
         }
@@ -321,7 +326,8 @@ private:
 int main(int argc, char** argv) {
     try {
         if (argc == 1 || std::string(argv[1]) == "--help") {
-            std::cout << "Usage: g1_getup_mimic_real {read-only|real} ROBOT_INTERFACE [--config JSON] [--expert NAME]\n";
+            std::cout << "Usage: g1_getup_mimic_real {read-only|real} ROBOT_INTERFACE [--config JSON] [--expert NAME]"
+                         " [--actuation drive_pd|host_torque]\n";
             return 0;
         }
         const std::string mode = argv[1];
@@ -331,6 +337,7 @@ int main(int argc, char** argv) {
         g1_control::RuntimeOptions options{true, 0, argv[2], G1_GETUP_MIMIC_DEFAULT_CONFIG};
         g1_control::ValidateRuntimeOptions(options);
         std::string expert;
+        std::optional<ActuationMode> actuation;
         for (int i = 3; i < argc; ++i) {
             const std::string key = argv[i];
             if (key == "--config") {
@@ -338,13 +345,16 @@ int main(int argc, char** argv) {
             } else if (key == "--expert") {
                 expert = g1_control::OptionValue(argc, argv, i, key);
                 if (expert.empty()) throw std::invalid_argument("Expected a model_test expert name");
+            } else if (key == "--actuation") {
+                actuation = ParseActuationMode(g1_control::OptionValue(argc, argv, i, key));
             } else {
                 throw std::invalid_argument("Unknown option: " + key);
             }
         }
         const PolicyConfig config(options.config, expert);
-        const HardwareSettings settings(config.root);
+        const HardwareSettings settings(config.root, actuation);
         if (!expert.empty()) std::cout << "model_test expert " << expert << std::endl;
+        std::cout << "GetUpMimic actuation " << ActuationName(settings.actuation) << std::endl;
         g1_control::InstallSignalHandlers();
         unitree::robot::ChannelFactory::Instance()->Init(options.domain, options.interface);
         std::atomic<bool> armed{false}, remote_stop{false};

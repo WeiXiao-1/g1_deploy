@@ -22,8 +22,10 @@ def main():
     getup_mode = getup.add_mutually_exclusive_group()
     getup_mode.add_argument("--getup-mimic", action="store_true", help="Run fixed fallen-pose recovery cases")
     getup_mode.add_argument("--model_test", "--model-test", action="store_true",
-                            help="Run a single-frame get-up expert")
+                            help="Run a get-up expert with the real control period and protections")
     getup.add_argument("--expert", help="model_test profile (faceup or backup, default: faceup)")
+    getup.add_argument("--actuation", choices=("drive_pd", "host_torque"),
+                       help="Get-up actuation mode (default: drive_pd), uses --hardware-config")
     getup.add_argument("--mjcf", type=Path, help="Path to g1.xml from the GetUpMimic training bundle")
     getup.add_argument("--pose", choices=("all", "backup", "faceup"),
                        help="Recovery cases to run (default: all for GetUpMimic, selected pose for model_test)")
@@ -55,8 +57,9 @@ def main():
             parser.error("DDS domain, terrain generation and depth preview require --mujoco-root")
         if args.interactive and args.headless:
             parser.error("--interactive requires the MuJoCo viewer")
-        if args.monitor is not None and not (args.hardware_config and args.interactive and 0 <= args.monitor <= 65535):
-            parser.error("--monitor requires --hardware-config and --interactive, with a valid port")
+        hardware = args.hardware_config or args.model_test or args.actuation is not None
+        if args.monitor is not None and not (hardware and args.interactive and 0 <= args.monitor <= 65535):
+            parser.error("--monitor requires hardware configuration and --interactive, with a valid port")
         try:
             if not args.headless:
                 select_window_backend(args.window_backend)
@@ -64,7 +67,7 @@ def main():
 
             expert = (args.expert or "faceup") if args.model_test else None
             return run(PROJECT_ROOT, args.mjcf, args.pose, args.headless, args.follow,
-                       args.interactive, args.hardware_config, args.monitor, expert=expert)
+                       args.interactive, hardware, args.monitor, expert=expert, actuation=args.actuation)
         except ModuleNotFoundError as error:
             parser.exit(1, f"GetUpMimic requires a Python environment with MuJoCo and NumPy: {error}\n")
         except (KeyError, OSError, RuntimeError, ValueError) as error:
@@ -72,7 +75,7 @@ def main():
         except KeyboardInterrupt:
             parser.exit(130, "GetUpMimic interrupted\n")
     if (args.mjcf is not None or args.pose is not None or args.headless or args.interactive
-            or args.hardware_config or args.monitor is not None):
+            or args.hardware_config or args.actuation is not None or args.monitor is not None):
         parser.error("Get-up simulation options require --getup-mimic or --model_test")
     if args.mujoco_root is None:
         parser.error("--mujoco-root is required for the DDS environment")
