@@ -34,6 +34,7 @@ set_target_properties(g1_getup_mimic PROPERTIES INSTALL_RPATH "$ORIGIN/../lib")
 install(TARGETS g1_getup_mimic RUNTIME DESTINATION bin)
 install(FILES apps/getup_mimic/config/g1_getup_mimic.json
     apps/getup_mimic/config/g1_getup_mimic_reset.json DESTINATION apps/getup_mimic/config)
+install(FILES apps/getup_mimic/tools/read_trace.py DESTINATION apps/getup_mimic/tools)
 install(FILES apps/getup_mimic/models/model_14000.onnx DESTINATION apps/getup_mimic/models)
 install(FILES apps/getup_mimic/checks/model_14000.json DESTINATION apps/getup_mimic/checks)
 install(FILES apps/getup_mimic/models/face-up/model_9000.onnx

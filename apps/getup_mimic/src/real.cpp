@@ -77,11 +77,16 @@ struct Commands {
 };
 
 Commands BuildCommands(const HardwareSettings& settings, const State& state, std::uint8_t mode_machine,
-                       const MotorTargets* targets, float weight) {
+                       const MotorTargets* targets, float weight, trace::ControlRecord* record = nullptr) {
     Commands commands{};
     commands.monitor.mode_machine() = mode_machine;
     commands.monitor.mode_pr() = 0;  // PR coordinates.
     const auto actuation = ComputeActuation(settings, state, targets, weight);
+    if (record) {
+        record->estimated_pd_torque = actuation.torque;
+        record->effective_kp = actuation.applied.kp;
+        record->effective_kd = actuation.applied.kd;
+    }
     g1_control::SetPositionTargets(commands.monitor, actuation.applied.position,
                                    actuation.applied.kp, actuation.applied.kd);
     commands.motor = commands.monitor;
@@ -100,10 +105,13 @@ Commands BuildCommands(const HardwareSettings& settings, const State& state, std
 struct PolicyInput {
     State state;
     std::uint64_t sequence;
+    std::uint64_t control_sample_id{}, activation_id{}, submitted_ns{};
+    std::uint32_t lowstate_tick{};
 };
 struct TimedTargets {
     MotorTargets targets;
     double milliseconds;
+    std::uint64_t inference_id{};
 };
 
 class RealController {
@@ -112,19 +120,58 @@ class RealController {
 public:
     RealController(const HardwareSettings& settings, const Receiver& receiver, Policy& policy,
                    const PolicyConfig& config, const std::string& reset_pose,
-                   std::atomic<bool>& armed, const std::atomic<bool>& remote_stop)
+                   std::atomic<bool>& armed, const std::atomic<bool>& remote_stop, trace::Recorder* recorder)
         : settings_(settings), receiver_(receiver), armed_(armed), remote_stop_(remote_stop),
-          reset_(config, settings, reset_pose), worker_(
+          reset_(config, settings, reset_pose), recorder_(recorder), worker_(
               [this, &policy](const PolicyInput& input, const auto&) {
+                  const auto producer_begin = recorder_ ? trace::NowNs() : 0;
+                  auto* record = recorder_ ? recorder_->BeginInference() : nullptr;
+                  const auto inference_id = ++inference_sequence_;
+                  if (record) {
+                      record->id = inference_id;
+                      record->activation_id = input.activation_id;
+                      record->control_sample_id = input.control_sample_id;
+                      record->state_received_ns = input.sequence;
+                      record->submitted_ns = input.submitted_ns;
+                      record->producer_begin_ns = producer_begin;
+                      record->lowstate_tick = input.lowstate_tick;
+                      record->q = input.state.position;
+                      record->dq = input.state.velocity;
+                      record->pelvis_quaternion = input.state.pelvis_quaternion;
+                      record->pelvis_gyro = input.state.pelvis_angular_velocity;
+                  }
                   const auto start = Clock::now();
-                  auto targets = policy.Step(input.state);
-                  const auto elapsed = Clock::now() - start;
+                  MotorTargets targets;
+                  try {
+                      targets = policy.Step(input.state, record ? &record->policy : nullptr);
+                  } catch (...) {
+                      if (record) {
+                          record->flags = 2;
+                          record->inference_start_ns = trace::Ns(start);
+                          record->inference_end_ns = trace::NowNs();
+                          record->enqueue_ready_ns = trace::NowNs();
+                          recorder_->CommitInference();
+                      }
+                      throw;
+                  }
+                  const auto finished = Clock::now();
+                  const auto elapsed = finished - start;
+                  if (record) {
+                      record->flags = 1;
+                      record->inference_start_ns = trace::Ns(start);
+                      record->inference_end_ns = trace::Ns(finished);
+                      record->target = targets.position;
+                      record->kp = targets.kp;
+                      record->kd = targets.kd;
+                      record->enqueue_ready_ns = trace::NowNs();
+                      recorder_->CommitInference();
+                  }
                   const double milliseconds = std::chrono::duration<double, std::milli>(elapsed).count();
                   if (elapsed > kPolicyPeriod) {
                       log_.Line() << "Policy inference took " << milliseconds << " ms, exceeding the "
                                   << kPolicyPeriod.count() << " ms period.\n";
                   }
-                  return TimedTargets{targets, milliseconds};
+                  return TimedTargets{targets, milliseconds, inference_id};
               }, [&policy] { policy.Reset(); }, true, kPolicyPeriod) {}
 
     int Run() {
@@ -137,6 +184,8 @@ public:
         bool failed = false;
         try {
             while (!StopRequested()) {
+                trace::ControlScope record_scope(recorder_, ++control_sequence_);
+                auto* record = record_scope.Get();
                 auto snapshot = ReadFresh();
                 remote_.Update(snapshot.value.wireless_remote());
                 const char remote_action = remote_.state.Action();
@@ -146,10 +195,23 @@ public:
                 if (action == '9' && !armed_) TakeOver(snapshot);
                 if (StopRequested()) break;
                 const auto state = ReadPolicyState(snapshot.value);
+                if (record) {
+                    record->flags = trace::StateValid;
+                    record->state_received_ns = trace::Ns(snapshot.received_at);
+                    record->lowstate_tick = snapshot.value.tick();
+                    record->q = state.position;
+                    record->dq = state.velocity;
+                    record->pelvis_quaternion = state.pelvis_quaternion;
+                    record->pelvis_gyro = state.pelvis_angular_velocity;
+                    record->pelvis_accelerometer = snapshot.value.imu_state().accelerometer();
+                    for (int j=0;j<kJointCount;++j) record->tau_est[j]=snapshot.value.motor_state()[j].tau_est();
+                }
                 if (armed_) CheckActiveState(snapshot.value, state);
                 if (action == 'f' || action == 'F') BeginReset(state);
                 if ((action == 'p' || action == 'P') && !running_) Begin();
-                Update(snapshot, state);
+                if (record) record->activation_id = activation_id_;
+                Update(snapshot, state, record);
+                record_scope.Finish();
                 cycle.Sleep();
             }
         } catch (const std::exception& error) {
@@ -226,6 +288,7 @@ private:
             entry_hold_ = reset_.Update(Seconds());
             reset_.Cancel();
         } else entry_hold_.reset();
+        ++activation_id_;
         worker_.Begin(false);
         running_ = true;
         started_ = Clock::now();
@@ -236,7 +299,7 @@ private:
         log_.Line() << (armed_ ? "Get-up ON.\n" : "Dry-run policy ON. Targets are preview only.\n");
     }
 
-    void Update(const Snapshot& snapshot, const State& state) {
+    void Update(const Snapshot& snapshot, const State& state, trace::ControlRecord* record) {
         const auto now = Clock::now();
         if (reset_.Active()) {
             const bool was_complete = reset_.Complete();
@@ -244,17 +307,28 @@ private:
             if (!was_complete && reset_.Complete()) {
                 log_.Line() << "Reset target interpolation complete. Holding; P/X starts policy from live state, F/A repeats reset.\n";
             }
-            Publish(state, snapshot, &target, 1.f);
+            if (record) record->phase = reset_.Complete() ? trace::Holding : trace::Resetting;
+            Publish(state, snapshot, &target, 1.f, record);
             return;
         }
         std::optional<Worker::Result> latest;
         if (running_) {
-            worker_.Submit({state, static_cast<std::uint64_t>(snapshot.received_at.time_since_epoch().count())}, {});
+            worker_.Submit({state, trace::Ns(snapshot.received_at), control_sequence_, activation_id_,
+                            recorder_ ? trace::NowNs() : 0, snapshot.value.tick()}, {});
             latest = worker_.Latest();
             if (latest) TrackProgress(*latest, state, now);
         }
+        if (record) {
+            record->phase = running_ ? (progress_.IsStanding() ? trace::Standing : trace::Policy)
+                                     : (armed_ ? trace::Standby : trace::Off);
+            if (latest && running_) {
+                record->inference_id = latest->target.inference_id;
+                record->result_input_ns = trace::Ns(latest->input_at);
+                record->result_completed_ns = trace::Ns(latest->completed_at);
+            }
+        }
         telemetry_.PublishEnable(armed_);
-        if (!armed_ && !latest) return;
+        if (!armed_ && !latest && !record) return;
         float weight = 0.f;
         if (latest && running_) {
             const auto elapsed = std::chrono::duration<double>(now - *ramp_started_).count();
@@ -267,19 +341,43 @@ private:
             target = &*blended;
             weight = 1.f;
         }
-        Publish(state, snapshot, target, weight);
+        Publish(state, snapshot, target, weight, record);
     }
 
-    void Publish(const State& state, const Snapshot& snapshot, const MotorTargets* target, float weight) {
+    void Publish(const State& state, const Snapshot& snapshot, const MotorTargets* target, float weight,
+                 trace::ControlRecord* record) {
         telemetry_.PublishEnable(armed_);
-        const auto commands = BuildCommands(settings_, state, snapshot.value.mode_machine(), target, weight);
+        const auto commands = BuildCommands(settings_, state, snapshot.value.mode_machine(), target, weight, record);
+        if (record) {
+            record->command_ready_ns = trace::NowNs();
+            record->requested_target = target ? target->position : state.position;
+            if (target) record->flags |= trace::RequestedTarget;
+            RecordCommand(*record, commands.motor);
+        }
         if (armed_) {
+            if (record) record->flags |= trace::Armed;
             if (StopRequested()) return;
             if (monitor_->Conflict()) throw std::runtime_error("Competing LowCmd publisher");
-            if (!publisher_->Write(commands.motor)) throw std::runtime_error("LowCmd publication failed");
+            if (record) record->write_start_ns = trace::NowNs();
+            const bool written = publisher_->Write(commands.motor);
+            if (record) {
+                record->write_end_ns = trace::NowNs();
+                if (written) record->flags |= trace::Published;
+            }
+            if (!written) throw std::runtime_error("LowCmd publication failed");
             telemetry_.PublishTarget(commands.monitor);
         } else if (running_ || reset_.Active()) {
             telemetry_.PublishPreview(commands.monitor);
+            if (record) record->flags |= trace::Preview;
+        }
+    }
+
+    static void RecordCommand(trace::ControlRecord& record, const LowCmd& command) {
+        record.flags |= trace::CommandPrepared;
+        for (int j=0;j<kJointCount;++j) {
+            const auto& motor=command.motor_cmd()[j];
+            record.command_q[j]=motor.q();record.command_dq[j]=motor.dq();
+            record.command_kp[j]=motor.kp();record.command_kd[j]=motor.kd();record.command_tau[j]=motor.tau();
         }
     }
 
@@ -340,7 +438,19 @@ private:
         g1_control::LoopScheduler<> cycle;
         bool written = false;
         while (!monitor_->Conflict() && Clock::now() < end) {
-            written |= publisher_->Write(stop);
+            trace::ControlScope scope(recorder_,++control_sequence_);
+            auto* record=scope.Get();
+            if(record) {
+                record->activation_id=activation_id_;record->phase=trace::Stop;
+                record->flags=trace::Armed;
+                if(failed)record->flags|=trace::FailedStop;
+                RecordCommand(*record,stop);record->command_ready_ns=trace::NowNs();
+                record->write_start_ns=trace::NowNs();
+            }
+            const bool sent=publisher_->Write(stop);
+            written |= sent;
+            if(record) {record->write_end_ns=trace::NowNs();if(sent)record->flags|=trace::Published;}
+            scope.Finish();
             cycle.Sleep();
         }
         publisher_.reset();
@@ -360,6 +470,8 @@ private:
     PoseReset reset_;
     std::optional<MotorTargets> entry_hold_;
     std::unique_ptr<g1_control::MotorPublisher> publisher_;
+    trace::Recorder* recorder_;
+    std::uint64_t control_sequence_=0, activation_id_=0, inference_sequence_=0;
     Worker worker_;
     Clock::time_point started_{}, next_report_{}, latest_reported_{};
     std::optional<Clock::time_point> ramp_started_;
@@ -375,7 +487,7 @@ int main(int argc, char** argv) {
     try {
         if (argc == 1 || std::string(argv[1]) == "--help") {
             std::cout << "Usage: g1_getup_mimic_real {read-only|real} ROBOT_INTERFACE [--config JSON] [--expert NAME]"
-                         " [--actuation drive_pd|host_torque] [--reset-pose recovered|recorded|3|dwaq-reset]\n";
+                         " [--actuation drive_pd|host_torque] [--reset-pose recovered|recorded|3|dwaq-reset] [--record-dir DIRECTORY]\n";
             return 0;
         }
         const std::string mode = argv[1];
@@ -386,6 +498,7 @@ int main(int argc, char** argv) {
         g1_control::ValidateRuntimeOptions(options);
         std::string expert;
         std::string reset_pose = "recovered";
+        std::string record_dir;
         std::optional<ActuationMode> actuation;
         for (int i = 3; i < argc; ++i) {
             const std::string key = argv[i];
@@ -398,6 +511,9 @@ int main(int argc, char** argv) {
                 actuation = ParseActuationMode(g1_control::OptionValue(argc, argv, i, key));
             } else if (key == "--reset-pose") {
                 reset_pose = g1_control::OptionValue(argc, argv, i, key);
+            } else if (key == "--record-dir" && mode == "real") {
+                record_dir = g1_control::OptionValue(argc, argv, i, key);
+                if (record_dir.empty()) throw std::invalid_argument("Expected a controller trace directory");
             } else {
                 throw std::invalid_argument("Unknown option: " + key);
             }
@@ -406,6 +522,19 @@ int main(int argc, char** argv) {
         const HardwareSettings settings(config.root, actuation);
         if (!expert.empty()) std::cout << "model_test expert " << expert << std::endl;
         std::cout << "GetUpMimic actuation " << ActuationName(settings.actuation) << std::endl;
+        std::unique_ptr<trace::Recorder> recorder;
+        if (!record_dir.empty()) {
+            trace::Metadata metadata;
+            metadata.config_path = std::filesystem::absolute(options.config).string();
+            metadata.reset_path = g1_config::ResolvePath(config.path,
+                config.root["reset_path"] ? config.root["reset_path"].as<std::string>() : "g1_getup_mimic_reset.json");
+            metadata.model_path = g1_config::ResolvePath(config.path,config.model["policy_path"].as<std::string>());
+            metadata.reset_pose = reset_pose;metadata.expert = expert;metadata.actuation = ActuationName(settings.actuation);
+            metadata.policy_names = config.root["joint_names"].as<std::vector<std::string>>();
+            metadata.motor_names.assign(g1_joints::kDdsNames.begin(),g1_joints::kDdsNames.end());
+            recorder = std::make_unique<trace::Recorder>(record_dir,metadata);
+            std::cout << "Controller trace: " << recorder->Directory() << " (asynchronous, best effort)\n";
+        }
         g1_control::InstallSignalHandlers();
         unitree::robot::ChannelFactory::Instance()->Init(options.domain, options.interface);
         std::atomic<bool> armed{false}, remote_stop{false};
@@ -427,7 +556,15 @@ int main(int argc, char** argv) {
         Policy policy(config);
         policy.Step(state);  // Warm the model without allowing motor output.
         policy.Reset();
-        return RealController(settings, receiver, policy, config, reset_pose, armed, remote_stop).Run();
+        const int result = RealController(settings, receiver, policy, config, reset_pose, armed, remote_stop, recorder.get()).Run();
+        // The temporary controller and its inference worker are now destroyed.
+        if (recorder) {
+            recorder->Close();
+            std::cout << "Controller trace closed: " << recorder->Directory() << "; dropped inference="
+                      << recorder->InferenceDropped() << ", control=" << recorder->ControlDropped()
+                      << ", write errno=" << recorder->Error() << '\n';
+        }
+        return result;
     } catch (const std::exception& error) {
         std::cerr << "Error: " << error.what() << '\n';
         return 1;

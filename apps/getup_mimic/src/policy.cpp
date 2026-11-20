@@ -114,7 +114,7 @@ Joints Policy::Predict(float* observation, std::size_t size) {
     return g1_onnx::Run<kJointCount>(*session_, {input}, output_name_);
 }
 
-MotorTargets Policy::Step(const State& state) {
+MotorTargets Policy::Step(const State& state, trace::PolicySnapshot* snapshot) {
     auto next_history = history_;
     bool next_history_ready = history_ready_;
     auto frame = BuildFrame(state);
@@ -127,7 +127,13 @@ MotorTargets Policy::Step(const State& state) {
     }
 
     // The history model clips inside ONNX. Expert exports return raw actor actions.
+    if (snapshot) {
+        static_assert(kObservationSize == trace::kMaxObservation);
+        snapshot->observation_size = observation_size_;
+        std::copy_n(observation, observation_size_, snapshot->observation.begin());
+    }
     auto action = Predict(observation, observation_size_);
+    if (snapshot) snapshot->onnx_action = action;
     if (action_clip_ > 0.f) {
         for (float& value : action) value = std::clamp(value, -action_clip_, action_clip_);
     }
@@ -142,6 +148,7 @@ MotorTargets Policy::Step(const State& state) {
     history_ = next_history;
     history_ready_ = next_history_ready;
     last_action_ = action;
+    if (snapshot) snapshot->applied_action = action;
     return result;
 }
 

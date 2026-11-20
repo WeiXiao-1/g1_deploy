@@ -1,5 +1,7 @@
 #pragma once
 
+#include "g1_getup_mimic_trace.h"
+
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -45,7 +47,7 @@ class Policy {
 public:
     explicit Policy(const PolicyConfig& config);
 
-    MotorTargets Step(const State& state);
+    MotorTargets Step(const State& state, trace::PolicySnapshot* snapshot = nullptr);
     void Reset();
 
     // Exposes the model boundary for checking exported observation/action pairs.

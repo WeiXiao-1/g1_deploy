@@ -126,6 +126,35 @@ cmake --build build -j4
 手动停止会停止策略、发送零力矩命令并退出。低层状态失效、策略输入或结果过期、推理异常或电机异常时使用驱动侧阻尼退出。策略首次结果、结果年龄和对应输入的年龄均受 30 ms 看门狗约束。检测到竞争发布者时释放本程序的发送端。
 这些是软件控制行为。首次实机验收需核对对应机型的关节范围、力矩字段行为和停止响应，并按该机的低层开发文档开展有现场保护的试验。
 
+### GetUpMimic 实机内部异步记录
+
+默认关闭。在 `real` 命令后添加 `--record-dir DIRECTORY` 开启，同样支持 `model_test --expert faceup|backup`：
+
+```bash
+./g1 getup-mimic real eth0 --actuation drive_pd --reset-pose dwaq-reset \
+  --record-dir ./logs/controller_runs
+./g1 model_test real eth0 --expert faceup --actuation drive_pd --reset-pose dwaq-reset \
+  --record-dir ./logs/controller_runs
+```
+
+每次启动创建独立的 `run_<启动时间戳>_<PID>` 目录，终端打印完整路径。包括 `manifest.json`、配置快照、`records.bin`；正常退出后还会写入 `stats.json`。模型路径及 FNV-1a 64 位文件指纹用于识别当时的模型和配置，模型文件本身不重复复制。此功能独立于网页监控数据库，不改变 P 的启动条件、复位姿态或输出限制。
+
+- 推理线程按实际发生的每次推理记录：接收状态、提交/开始/结束时间、准确的 ONNX 输入（14000 为 744 维，专家为 93 维）、ONNX 返回动作、外部裁剪后动作，以及缩放后的策略目标。ONNX 返回动作可能已经经过模型内部限幅。
+- 控制线程按实际 2 ms 循环记录：状态及 IMU、输入来源、关联推理编号、渐入/混合后的候选目标、最终 LowCmd 的 q/dq/Kp/Kd/tau、主机估算 PD 力矩、DDS Write 前后时间和是否发布成功。还包括复位、保持、预览、待命和停机阶段；未发布的候选命令带有明确标记。
+- 所有时间使用同一主机的单调时钟；`manifest.json` 保存对应的墙钟锚点。实际关节和电机命令采用 DDS 顺序，ONNX 输入及动作采用策略顺序，名称和二进制字段布局均随日志保存。成功调用 DDS Write 不等于电机已经执行；`command_tau` 在 drive_pd 下是前馈，实际反馈力矩另存为 `tau_est`。
+
+两个生产线程各使用独立、预分配的无锁单生产者队列（推理 256 帧、控制 1024 帧），不在记录路径执行文件写入或 CSV 格式化。后台线程写二进制文件并定期刷新；队列满或写盘失败时丢弃记录并计数，不等待磁盘、不因此停止控制。磁盘刷新和队列排空在电机释放之后完成。数据量约为每秒 1 MB，实际取决于推理及控制频率。
+
+正常停止程序后，使用不依赖 SDK/MuJoCo/NumPy 的离线工具解码：
+
+```bash
+python3 apps/getup_mimic/tools/read_trace.py ./logs/controller_runs/run_实际目录名
+```
+
+默认输出到该运行目录下的 `decoded/`：`inference.jsonl`、`control.jsonl` 和 `summary.json`。概要包含推理及控制耗时的均值、P95/P99、最大值、状态接收到发布的时间以及丢帧信息。文件尾部不完整时保留此前可解析记录并告警；缺少最终 `stats.json` 时不能假定没有丢帧。两个队列的写盘顺序不代表时间顺序，应按编号、时间戳关联。输入保存在 ONNX 内部归一化之前，适合重放到同一模型。
+
+异步记录仍占用 CPU、内存带宽和磁盘资源，不能保证零影响。工控机约 9 ms 推理、10 ms 周期的情况下，应对比开启/关闭记录时原有推理耗时报告，并检查解码结果中的控制耗时、周期和丢帧情况。桌面离线测试不能代替工控机实测。
+
 ### GetUpMimic 四套姿态复位与 MuJoCo 吊绳
 
 复位独立实现于 `apps/getup_mimic/include/g1_getup_mimic_reset.h`，只用于 GetUpMimic 和 `model_test`，不修改 DWaQ、Parkour、StableMimic 的控制逻辑。它不修改模型的 `default_joint_pos` 或动作缩放。

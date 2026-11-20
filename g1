@@ -94,7 +94,8 @@ if [[ "$mode" == getup-mimic || "$mode" == model_test ]]; then
     getup_usage() {
         printf '%s\n' "Usage: ./g1 $mode check [--config JSON]" \
             "       ./g1 $mode read-only|real INTERFACE [--config JSON] [--actuation drive_pd|host_torque]" \
-            "       --reset-pose recovered|recorded|3|dwaq-reset selects the F/A reset target (default: recovered)"
+            "       --reset-pose recovered|recorded|3|dwaq-reset selects the F/A reset target (default: recovered)" \
+            "       --record-dir DIRECTORY enables asynchronous internal tracing in real mode (default: off)"
         if [[ "$mode" == model_test ]]; then
             printf '%s\n' 'Options: --expert faceup|backup (default: faceup)'
         fi
