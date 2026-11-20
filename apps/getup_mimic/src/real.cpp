@@ -1,4 +1,5 @@
 #include "g1_getup_mimic_control.h"
+#include "g1_getup_mimic_reset.h"
 
 #include "g1_async_log.h"
 #include "g1_control_options.h"
@@ -110,8 +111,10 @@ class RealController {
 
 public:
     RealController(const HardwareSettings& settings, const Receiver& receiver, Policy& policy,
+                   const PolicyConfig& config, const std::string& reset_pose,
                    std::atomic<bool>& armed, const std::atomic<bool>& remote_stop)
-        : settings_(settings), receiver_(receiver), armed_(armed), remote_stop_(remote_stop), worker_(
+        : settings_(settings), receiver_(receiver), armed_(armed), remote_stop_(remote_stop),
+          reset_(config, settings, reset_pose), worker_(
               [this, &policy](const PolicyInput& input, const auto&) {
                   const auto start = Clock::now();
                   auto targets = policy.Step(input.state);
@@ -127,20 +130,25 @@ public:
     int Run() {
         telemetry_.Start();
         telemetry_.PublishEnable(false);
-        std::cout << "GetUpMimic DRY RUN. P/X previews, 9/Start takes over, Space/Select exits.\n" << std::flush;
+        std::cout << "GetUpMimic DRY RUN. F/A: pose reset, "
+                     "P/X: policy, 9/Start: takeover, Space/Select: exit. Reset pose: "
+                  << reset_.Selected() << '\n' << std::flush;
         g1_control::LoopScheduler<> cycle;
         bool failed = false;
         try {
             while (!StopRequested()) {
                 auto snapshot = ReadFresh();
                 remote_.Update(snapshot.value.wireless_remote());
-                const char action = g1_control::SelectAction(keyboard_.Read(false), remote_.state.Action());
+                const char remote_action = remote_.state.Action();
+                const char action = g1_control::SelectAction(keyboard_.Read(false),
+                    remote_action == 'r' ? 'f' : remote_action);  // A resets only this controller.
                 if (action == ' ') break;
                 if (action == '9' && !armed_) TakeOver(snapshot);
                 if (StopRequested()) break;
                 const auto state = ReadPolicyState(snapshot.value);
                 if (armed_) CheckActiveState(snapshot.value, state);
-                if ((action == 'p' || action == 'P') && !running_) Begin(state);
+                if (action == 'f' || action == 'F') BeginReset(state);
+                if ((action == 'p' || action == 'P') && !running_) Begin();
                 Update(snapshot, state);
                 cycle.Sleep();
             }
@@ -212,11 +220,12 @@ private:
         log_.Line() << "Control enabled. Damping only. P/X starts get-up from the measured pose.\n";
     }
 
-    void Begin(const State& state) {
-        if (armed_ && (!g1_control::InputReady(&remote_.state) || !ReadyToGetUp(settings_, state))) {
-            log_.Line() << "Get-up requires centered sticks and a resting robot.\n";
-            return;
-        }
+    void Begin() {
+        // P starts from live state, including during reset and with tracking error.
+        if (reset_.Active()) {
+            entry_hold_ = reset_.Update(Seconds());
+            reset_.Cancel();
+        } else entry_hold_.reset();
         worker_.Begin(false);
         running_ = true;
         started_ = Clock::now();
@@ -229,6 +238,15 @@ private:
 
     void Update(const Snapshot& snapshot, const State& state) {
         const auto now = Clock::now();
+        if (reset_.Active()) {
+            const bool was_complete = reset_.Complete();
+            const auto target = reset_.Update(Seconds());
+            if (!was_complete && reset_.Complete()) {
+                log_.Line() << "Reset target interpolation complete. Holding; P/X starts policy from live state, F/A repeats reset.\n";
+            }
+            Publish(state, snapshot, &target, 1.f);
+            return;
+        }
         std::optional<Worker::Result> latest;
         if (running_) {
             worker_.Submit({state, static_cast<std::uint64_t>(snapshot.received_at.time_since_epoch().count())}, {});
@@ -242,14 +260,25 @@ private:
             const auto elapsed = std::chrono::duration<double>(now - *ramp_started_).count();
             weight = RampWeight(settings_, elapsed);
         }
-        const auto commands = BuildCommands(settings_, state, snapshot.value.mode_machine(),
-                                             latest && running_ ? &latest->target.targets : nullptr, weight);
+        std::optional<MotorTargets> blended;
+        const MotorTargets* target = latest && running_ ? &latest->target.targets : nullptr;
+        if (entry_hold_ && running_) {
+            blended = target ? BlendPoseEntry(*entry_hold_, *target, weight) : *entry_hold_;
+            target = &*blended;
+            weight = 1.f;
+        }
+        Publish(state, snapshot, target, weight);
+    }
+
+    void Publish(const State& state, const Snapshot& snapshot, const MotorTargets* target, float weight) {
+        telemetry_.PublishEnable(armed_);
+        const auto commands = BuildCommands(settings_, state, snapshot.value.mode_machine(), target, weight);
         if (armed_) {
             if (StopRequested()) return;
             if (monitor_->Conflict()) throw std::runtime_error("Competing LowCmd publisher");
             if (!publisher_->Write(commands.motor)) throw std::runtime_error("LowCmd publication failed");
             telemetry_.PublishTarget(commands.monitor);
-        } else if (running_) {
+        } else if (running_ || reset_.Active()) {
             telemetry_.PublishPreview(commands.monitor);
         }
     }
@@ -281,6 +310,23 @@ private:
         worker_.Pause();
         running_ = false;
         progress_.Reset();
+        reset_.Cancel();
+        entry_hold_.reset();
+    }
+
+    static double Seconds() {
+        return std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
+    }
+
+    void BeginReset(const State& state) {
+        if (armed_ && (!g1_control::InputReady(&remote_.state) || !ReadyToGetUp(settings_, state))) {
+            log_.Line() << "Pose reset requires centered sticks and a resting robot.\n";
+            return;
+        }
+        HaltPolicy();
+        reset_.Begin(state, Seconds());
+        log_.Line() << (armed_ ? "REAL" : "PREVIEW") << " pose reset: " << reset_.Selected()
+                    << ", duration " << reset_.Duration() << " s; then hold.\n";
     }
 
     void ReleaseOutput(bool failed) {
@@ -311,6 +357,8 @@ private:
     g1_unitree_remote::Input remote_;
     g1_control::MonitorPublisher telemetry_;
     std::unique_ptr<g1_control::CommandMonitor> monitor_;
+    PoseReset reset_;
+    std::optional<MotorTargets> entry_hold_;
     std::unique_ptr<g1_control::MotorPublisher> publisher_;
     Worker worker_;
     Clock::time_point started_{}, next_report_{}, latest_reported_{};
@@ -327,7 +375,7 @@ int main(int argc, char** argv) {
     try {
         if (argc == 1 || std::string(argv[1]) == "--help") {
             std::cout << "Usage: g1_getup_mimic_real {read-only|real} ROBOT_INTERFACE [--config JSON] [--expert NAME]"
-                         " [--actuation drive_pd|host_torque]\n";
+                         " [--actuation drive_pd|host_torque] [--reset-pose recovered|recorded|3|dwaq-reset]\n";
             return 0;
         }
         const std::string mode = argv[1];
@@ -337,6 +385,7 @@ int main(int argc, char** argv) {
         g1_control::RuntimeOptions options{true, 0, argv[2], G1_GETUP_MIMIC_DEFAULT_CONFIG};
         g1_control::ValidateRuntimeOptions(options);
         std::string expert;
+        std::string reset_pose = "recovered";
         std::optional<ActuationMode> actuation;
         for (int i = 3; i < argc; ++i) {
             const std::string key = argv[i];
@@ -347,6 +396,8 @@ int main(int argc, char** argv) {
                 if (expert.empty()) throw std::invalid_argument("Expected a model_test expert name");
             } else if (key == "--actuation") {
                 actuation = ParseActuationMode(g1_control::OptionValue(argc, argv, i, key));
+            } else if (key == "--reset-pose") {
+                reset_pose = g1_control::OptionValue(argc, argv, i, key);
             } else {
                 throw std::invalid_argument("Unknown option: " + key);
             }
@@ -376,7 +427,7 @@ int main(int argc, char** argv) {
         Policy policy(config);
         policy.Step(state);  // Warm the model without allowing motor output.
         policy.Reset();
-        return RealController(settings, receiver, policy, armed, remote_stop).Run();
+        return RealController(settings, receiver, policy, config, reset_pose, armed, remote_stop).Run();
     } catch (const std::exception& error) {
         std::cerr << "Error: " << error.what() << '\n';
         return 1;

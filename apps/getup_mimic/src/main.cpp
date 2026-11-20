@@ -1,4 +1,5 @@
 #include "g1_getup_mimic_control.h"
+#include "g1_getup_mimic_reset.h"
 
 #include "g1_config_utils.h"
 #include "g1_control_options.h"
@@ -14,6 +15,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -158,23 +160,41 @@ int RunSimulationStream(const PolicyConfig& config) {
     return 0;
 }
 
-int RunHardwareSimulationStream(const PolicyConfig& config, std::optional<ActuationMode> actuation_override) {
+int RunHardwareSimulationStream(const PolicyConfig& config, std::optional<ActuationMode> actuation_override,
+                                const std::string& reset_pose, double inference_delay_ms) {
     const HardwareSettings settings(config.root, actuation_override);
     const bool drive_pd = settings.actuation == ActuationMode::DrivePd;
     Policy policy(config);
+    PoseReset pose_reset(config, settings, reset_pose);
     constexpr auto control_period = g1_control::kControlPeriod;
     static_assert(kPolicyPeriod % control_period == std::chrono::milliseconds::zero());
-    constexpr auto steps_per_inference = kPolicyPeriod / control_period;
     std::cout << (drive_pd ? "g1-getup-mimic-drive-pd-v1 " : "g1-getup-mimic-hardware-v1 ")
               << kPolicyPeriod.count() << ' ' << control_period.count() << ' ' << settings.timeout_seconds
               << ' ' << settings.limits.stop_kd << ' ' << settings.limits.damping_seconds;
     if (drive_pd) WriteJointValues(settings.effort);
     WriteJointNames();
 
-    MotorTargets targets{};
+    struct SimulatedResult {
+        MotorTargets targets;
+        double completed_at;
+    };
+    std::optional<SimulatedResult> pending, latest;
+    std::optional<double> first_result_at;
+    double next_inference_at = 0;
     std::optional<MotorTargets> telemetry;
     RecoveryProgress progress;
     int tick = 0;
+    int reset_tick = 0;
+    std::optional<MotorTargets> entry_hold;
+    auto restart_inference = [&] {
+        policy.Reset();
+        progress.Reset();
+        pending.reset();
+        latest.reset();
+        first_result_at.reset();
+        next_inference_at = 0;
+        tick = reset_tick = 0;
+    };
     std::string line;
     while (std::getline(std::cin, line)) {
         std::istringstream input(line);
@@ -182,10 +202,19 @@ int RunHardwareSimulationStream(const PolicyConfig& config, std::optional<Actuat
         input >> command;
         if (command == "reset") {
             RequireEndOfCommand(input);
-            policy.Reset();
-            progress.Reset();
+            restart_inference();
             telemetry.reset();
-            tick = 0;
+            pose_reset.Cancel();
+            entry_hold.reset();
+            std::cout << "ok" << std::endl;
+            continue;
+        }
+        if (command == "pose") {
+            std::string name;
+            if (!(input >> name)) throw std::runtime_error("Missing reset pose name");
+            RequireEndOfCommand(input);
+            if (tick != 0) throw std::runtime_error("Stop policy before selecting reset pose");
+            pose_reset.Select(name);
             std::cout << "ok" << std::endl;
             continue;
         }
@@ -199,31 +228,79 @@ int RunHardwareSimulationStream(const PolicyConfig& config, std::optional<Actuat
             std::cout << std::endl;
             continue;
         }
-        if (command != "check" && command != "damping" && command != "getup") {
+        if (command != "check" && command != "check-reset" && command != "damping" && command != "getup" &&
+            command != "reset-pose" && command != "hold") {
             throw std::runtime_error("Unknown GetUpMimic hardware simulation command");
         }
         const auto state = ReadSimulationState(input);
         RequireEndOfCommand(input);
         try {
             CheckMeasuredPositions(settings, state);
-            if (command == "check") {
+            if (command == "check" || command == "check-reset") {
                 ProjectedGravity(state.pelvis_quaternion);  // Validate the simulated IMU quaternion.
-                std::cout << (ReadyToGetUp(settings, state) ? "ready" : "unready") << std::endl;
+                auto reason = EntryMotionBlockReason(settings, state);
+                if (reason.empty() && command == "check-reset") reason = pose_reset.EntryBlockReason(state);
+                std::cout << (reason.empty() ? "ready" : "unready " + reason) << std::endl;
                 continue;
             }
             const char* phase = "damping";
             const MotorTargets* active_targets = nullptr;
             float weight = 0.f;
+            std::optional<MotorTargets> reset_target;
+            if (command == "reset-pose") {
+                if (!ReadyToGetUp(settings, state)) throw std::runtime_error("Pose reset requires a resting robot");
+                restart_inference();
+                entry_hold.reset();
+                pose_reset.Begin(state, 0.);
+            }
+            if (command == "reset-pose" || command == "hold") {
+                const double elapsed = std::chrono::duration<double>(control_period * reset_tick++).count();
+                reset_target = pose_reset.Update(elapsed);
+                active_targets = &*reset_target;
+                weight = 1.f;
+                phase = pose_reset.Complete() ? "holding" : "resetting";
+            }
             if (command == "getup") {
+                if (pose_reset.Active()) {
+                    entry_hold = pose_reset.Update(
+                        std::chrono::duration<double>(control_period * reset_tick).count());
+                    pose_reset.Cancel();
+                    restart_inference();
+                }
                 const double elapsed = std::chrono::duration<double>(control_period * tick).count();
                 const auto status = progress.Update(settings, state, elapsed);
                 if (status == RecoveryProgress::Status::TimedOut) {
                     phase = "timeout";
                 } else {
-                    if (tick % steps_per_inference == 0) targets = policy.Step(state);
+                    // Compute using the launch-time observation, but make the
+                    // result visible only after simulated inference completes.
+                    // Physics/control keep running on the previous result.
+                    auto release_result = [&] {
+                        if (pending && elapsed + 1e-12 >= pending->completed_at) {
+                            latest = std::move(pending);
+                            pending.reset();
+                            // RealController starts its ramp when control first
+                            // consumes a result, at the next control tick.
+                            if (!first_result_at) first_result_at = elapsed;
+                        }
+                    };
+                    release_result();
+                    if (!pending && elapsed + 1e-12 >= next_inference_at) {
+                        pending = SimulatedResult{policy.Step(state), elapsed + inference_delay_ms / 1000.};
+                        // Match PolicyWorker: skip missed 10 ms deadlines after
+                        // a slow inference, without queuing or catch-up bursts.
+                        const double periods = std::floor(inference_delay_ms / kPolicyPeriod.count()) + 1;
+                        next_inference_at = elapsed + periods * std::chrono::duration<double>(kPolicyPeriod).count();
+                    }
+                    release_result();  // Zero delay retains the existing path.
                     ++tick;
-                    active_targets = &targets;
-                    weight = RampWeight(settings, elapsed);
+                    active_targets = latest ? &latest->targets : nullptr;
+                    weight = first_result_at ? RampWeight(settings, elapsed - *first_result_at) : 0.f;
+                    if (entry_hold) {
+                        reset_target = latest ? BlendPoseEntry(*entry_hold, latest->targets, weight) : *entry_hold;
+                        active_targets = &*reset_target;
+                        weight = 1.f;
+                    }
                     phase = status == RecoveryProgress::Status::Standing ? "standing" : "rising";
                 }
             }
@@ -255,6 +332,8 @@ int main(int argc, char** argv) {
         }
         std::string config_path = G1_GETUP_MIMIC_DEFAULT_CONFIG;
         std::string expert;
+        std::string reset_pose = "recovered";
+        double inference_delay_ms = 0;
         std::optional<ActuationMode> actuation;
         for (int i = 2; i < argc; ++i) {
             const std::string option = argv[i];
@@ -269,6 +348,14 @@ int main(int argc, char** argv) {
                 if (expert.empty()) throw std::invalid_argument("Expected a model_test expert name");
             } else if (option == "--actuation" && mode == "sim-hardware-stream") {
                 actuation = ParseActuationMode(g1_control::OptionValue(argc, argv, i, option));
+            } else if (option == "--reset-pose" && mode == "sim-hardware-stream") {
+                reset_pose = g1_control::OptionValue(argc, argv, i, option);
+            } else if (option == "--inference-delay-ms" && mode == "sim-hardware-stream") {
+                const auto value = g1_control::OptionValue(argc, argv, i, option);
+                std::size_t consumed = 0;
+                inference_delay_ms = std::stod(value, &consumed);
+                if (consumed != value.size() || !std::isfinite(inference_delay_ms) || inference_delay_ms < 0)
+                    throw std::invalid_argument("Inference delay must be a finite nonnegative number of milliseconds");
             } else {
                 throw std::invalid_argument("Unknown option: " + option);
             }
@@ -278,7 +365,7 @@ int main(int argc, char** argv) {
             if (!expert.empty()) std::cout << "model_test expert " << expert << '\n';
             return CheckPolicy(config);
         }
-        if (mode == "sim-hardware-stream") return RunHardwareSimulationStream(config, actuation);
+        if (mode == "sim-hardware-stream") return RunHardwareSimulationStream(config, actuation, reset_pose, inference_delay_ms);
         return RunSimulationStream(config);
     } catch (const std::exception& error) {
         std::cerr << "Error: " << error.what() << '\n';

@@ -44,7 +44,7 @@ class SimulationMonitor:
         now = time.monotonic()
         if now < self.next_sample and phase == self.last_phase:
             return
-        enabled = phase in {"ready", "running", "standing", "fault-damping"}
+        enabled = phase in {"ready", "running", "standing", "fault-damping", "reset-request", "resetting", "holding"}
         target = None
         if enabled and phase != "fault-damping":
             reply = self.read_targets()

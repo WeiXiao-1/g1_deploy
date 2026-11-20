@@ -4,6 +4,7 @@ The shared environment uses unitree_mujoco and DDS on lo. GetUpMimic uses
 the training bundle's MJCF and steps its C++ policy in simulation time.
 """
 import argparse
+import math
 from contextlib import ExitStack
 import os
 from pathlib import Path
@@ -26,6 +27,8 @@ def main():
     getup.add_argument("--expert", help="model_test profile (faceup or backup, default: faceup)")
     getup.add_argument("--actuation", choices=("drive_pd", "host_torque"),
                        help="Get-up actuation mode (default: drive_pd), uses --hardware-config")
+    getup.add_argument("--inference-delay-ms", type=float, default=None,
+                       help="Simulated inference duration in ms (default: 0); physics continues while results wait; uses hardware config")
     getup.add_argument("--mjcf", type=Path, help="Path to g1.xml from the GetUpMimic training bundle")
     getup.add_argument("--pose", choices=("all", "backup", "faceup"),
                        help="Recovery cases to run (default: all for GetUpMimic, selected pose for model_test)")
@@ -33,6 +36,12 @@ def main():
     getup.add_argument("--interactive", action="store_true", help="Use 9 to take over, P to get up and Space to stop")
     getup.add_argument("--hardware-config", action="store_true",
                        help="Use the real GetUpMimic control period and motion protections in MuJoCo")
+    getup.add_argument("--reset-pose", choices=("recovered", "recorded", "3", "dwaq-reset"), default=None,
+                       help="F reset target: recovered standing, recorded second hardware initial, 3 first hardware initial, or dwaq-reset angles")
+    getup.add_argument("--suspension", action="store_true",
+                       help="Start upright in the air with a torso cable; 6 pays out 0.1 m, 7 reels in 0.1 m")
+    getup.add_argument("--reset-test", action="store_true",
+                       help="Headless suspended pose reset and landing check, without starting policy")
     getup.add_argument("--monitor", nargs="?", const=8765, type=int, metavar="PORT",
                        help="Serve the joint dashboard on localhost (default port 8765)")
     parser.add_argument("--domain", type=int, default=1)
@@ -57,7 +66,14 @@ def main():
             parser.error("DDS domain, terrain generation and depth preview require --mujoco-root")
         if args.interactive and args.headless:
             parser.error("--interactive requires the MuJoCo viewer")
-        hardware = args.hardware_config or args.model_test or args.actuation is not None
+        if args.inference_delay_ms is not None and (not math.isfinite(args.inference_delay_ms) or args.inference_delay_ms < 0):
+            parser.error("--inference-delay-ms must be finite and nonnegative")
+        hardware = (args.hardware_config or args.model_test or args.actuation is not None
+                    or args.reset_pose is not None or args.suspension or args.inference_delay_ms is not None)
+        if args.reset_test and not (args.headless and args.suspension):
+            parser.error("--reset-test requires --suspension --headless")
+        if args.suspension and not (args.interactive or args.reset_test):
+            parser.error("--suspension requires --interactive or --reset-test --headless")
         if args.monitor is not None and not (hardware and args.interactive and 0 <= args.monitor <= 65535):
             parser.error("--monitor requires hardware configuration and --interactive, with a valid port")
         try:
@@ -67,7 +83,9 @@ def main():
 
             expert = (args.expert or "faceup") if args.model_test else None
             return run(PROJECT_ROOT, args.mjcf, args.pose, args.headless, args.follow,
-                       args.interactive, hardware, args.monitor, expert=expert, actuation=args.actuation)
+                       args.interactive, hardware, args.monitor, expert=expert, actuation=args.actuation,
+                       reset_pose=args.reset_pose or "recovered", suspension=args.suspension,
+                       reset_test=args.reset_test, inference_delay_ms=args.inference_delay_ms or 0.0)
         except ModuleNotFoundError as error:
             parser.exit(1, f"GetUpMimic requires a Python environment with MuJoCo and NumPy: {error}\n")
         except (KeyError, OSError, RuntimeError, ValueError) as error:
@@ -75,7 +93,8 @@ def main():
         except KeyboardInterrupt:
             parser.exit(130, "GetUpMimic interrupted\n")
     if (args.mjcf is not None or args.pose is not None or args.headless or args.interactive
-            or args.hardware_config or args.actuation is not None or args.monitor is not None):
+            or args.hardware_config or args.actuation is not None or args.monitor is not None
+            or args.reset_pose is not None or args.suspension or args.reset_test or args.inference_delay_ms is not None):
         parser.error("Get-up simulation options require --getup-mimic or --model_test")
     if args.mujoco_root is None:
         parser.error("--mujoco-root is required for the DDS environment")

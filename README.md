@@ -90,6 +90,18 @@ python3 apps/simulation/sim.py --getup-mimic --mjcf /path/to/g1.xml --hardware-c
 
 此模式在仿真时间中同步运行推理与物理，覆盖静止检查、关节限位、站稳判定和起身超时。DDS 掉包、推理实际耗时超限、驱动响应、温度和电机故障仍需在实机链路上验证。
 
+可用 `--inference-delay-ms 9` 近似实机约 9 ms 的推理耗时，默认 `0`。该参数自动启用实机配置，只影响 GetUpMimic / model_test 的独立 MuJoCo 仿真，不改变实机程序或其他项目。
+
+```bash
+python3 apps/simulation/sim.py --getup-mimic --mjcf /path/to/g1.xml \
+  --actuation drive_pd --reset-pose recorded --suspension \
+  --inference-delay-ms 9 --interactive --follow --monitor 8767
+```
+
+策略在启动时采样当前状态，结果经过指定的仿真时间后才可用；等待期间物理和低层控制继续以 2 ms 推进，保持上一条策略目标。首个结果到达前，执行过 F 则保持当前复位输出，否则保持待命阻尼。结果可用后，`drive_pd` 用当时最新关节状态计算 PD；180 ms 渐入从控制循环首次取得结果时开始。F 复位、6/7 吊绳控制和 P 的启动条件不受该参数影响。
+
+策略启动周期仍为 10 ms。9 ms 的结果在下一个控制周期（约 10 ms）生效，不会再额外延迟 9 ms；设置的耗时达到或超过 10 ms 时，按实机调度方式跳过错过的推理周期，不积压或集中补跑。延迟用仿真时间实现，未使用会冻结物理的 `sleep`。监控记录名称包含所设延迟，方便与 `--inference-delay-ms 0` 对照。该选项是固定推理耗时的近似，不包含 DDS 延迟、抖动和驱动内部响应，也未加入额外的延迟看门狗。
+
 ### GetUpMimic 实机
 
 完整构建包含 `g1_getup_mimic_real`。仅构建 GetUpMimic 时，加 `-DG1_GETUP_MIMIC_REAL=ON` 并提供 Unitree SDK2。
@@ -107,12 +119,65 @@ cmake --build build -j4
 `real` 启动后处于空跑，按 `P` 或遥控器 `X` 可预览策略目标，终端按秒报告推理耗时峰值。空跑目标发布到 `rt/g1/dry_run_target`。
 
 完成机型对应的低层调试准备后，模拟按键对应关系为 `9` / `Start` 接管、`P` / `X` 起身、空格 / `Select` 停止。
-接管和起身要求摇杆回中、关节速度和骨盆角速度低于静止阈值。接管完成后先进入阻尼待命，再次按 `P` / `X` 从最新实测姿态启动起身。实机与 `--hardware-config` 仿真的入口均接受任意初始骨盆角度。
+接管要求摇杆回中、关节速度和骨盆角速度低于静止阈值。接管完成后先进入阻尼待命，再次按 `P` / `X` 从最新实测姿态启动起身；P/X 不要求复位完成或到位，也不以关节速度、骨盆角速度、摇杆回中作为策略启动门槛。实机与 `--hardware-config` 仿真的策略入口均接受任意初始骨盆角度。
 策略周期为 10 ms，机载控制循环按 2 ms 调度。单次推理超过 10 ms 时只记录耗时。配置的 `hardware.actuation` 默认是 `drive_pd`，向驱动下发目标角和 PD 增益，`LowCmd.tau` 为零前馈。以 `--actuation host_torque` 启动时，由机载程序计算 PD，将裁剪后的总力矩放入 `LowCmd.tau`。两种模式均在首个策略结果到达后用 180 ms 渐入。
 关节限位和力矩上限按 DDS 电机顺序配置。两种模式都裁剪目标角，实测超过限位及其容差时会停止。`drive_pd` 按主机反馈估算力矩，触及配置上限时同比降低 `Kp/Kd`，在实测边界压制估算出的外向力矩。驱动侧实际总力矩上限由固件决定，`effort_limit` 在此模式下是主机估算的约束。`host_torque` 直接限幅下发力矩。站稳判据要求骨盆姿态、角速度和膝关节状态连续满足 1 秒。起身 15 秒未达到判据时退回阻尼待命。实机与仿真均关闭站稳后的倾斜停机。
 
 手动停止会停止策略、发送零力矩命令并退出。低层状态失效、策略输入或结果过期、推理异常或电机异常时使用驱动侧阻尼退出。策略首次结果、结果年龄和对应输入的年龄均受 30 ms 看门狗约束。检测到竞争发布者时释放本程序的发送端。
 这些是软件控制行为。首次实机验收需核对对应机型的关节范围、力矩字段行为和停止响应，并按该机的低层开发文档开展有现场保护的试验。
+
+### GetUpMimic 四套姿态复位与 MuJoCo 吊绳
+
+复位独立实现于 `apps/getup_mimic/include/g1_getup_mimic_reset.h`，只用于 GetUpMimic 和 `model_test`，不修改 DWaQ、Parkour、StableMimic 的控制逻辑。它不修改模型的 `default_joint_pos` 或动作缩放。
+
+启动参数 `--reset-pose recovered|recorded|3|dwaq-reset` 选择 F 键的目标，默认 `recovered`；运行中不切换姿态：
+
+- `recovered`：`model_14000` 从 faceup row 12531 起身成功后、进入策略 13 秒时的关节角快照。
+- `recorded`：第二次实机 CSV `8a738ae3…` 在 `elapsed_s=10.683662` 的关节角。属于屈膝、腰 yaw 非零的承重测试姿态。
+- `3`：第一次实机 CSV `b00c20f6…` 在 `elapsed_s=8.233719` 的 29 个实测关节角，距首个可见非零 Kp 策略命令约 144 ms。当时最大关节速度约 0.033 rad/s。仅选择复位姿态，不切换策略模型。
+- `dwaq-reset`：第四套，与上述三套平级。复制 DWaQ 当前 `default_joint_pos` 并按 `joint_ids_map` 转成 DDS 顺序，作为独立配置保存；仅复制角度，仍使用 GetUpMimic 的复位增益。左右髋 pitch 为 −0.1 rad、膝为 0.3 rad、踝 pitch 为 −0.2 rad，腰部三轴为零。
+
+全部 29 个角度及来源记录在 `apps/getup_mimic/config/g1_getup_mimic_reset.json`，采用所列 DDS 关节顺序和 rad 单位，四套姿态的关节目标均四舍五入保留三位小数。四套姿态用于对照实验，不代表已完成实机平衡验收。配置仅保存关节目标，不把此前估计的骨盆姿态用于实机。
+
+实机先按 `9/Start` 接管，再按 **F**（遥控器 **A**）复位。程序读取当前实测关节角，使用平滑插值，默认至少 4 秒，目标速度不超过 0.35 rad/s；若角差较大自动延长时间。增益在 0.3 秒内渐入。沿用现有关节限位、执行模式和力矩处理。与 DWaQ 一样，插值时间结束就显示 Holding 并持续发送固定目标和 PD 增益，不等待实测到位，也不因跟踪误差等待超时而停止。
+
+接管后按 **P/X** 就从当前实测状态启动策略，无需等待 F 插值结束、实测到位或静止；未执行 F 也可直接启动。进入策略会清空策略历史；执行过 F 时在 180 ms 内从当前复位输出平滑过渡到策略目标，不先撤掉保持力矩。空跑时 F 只预览目标；按 9 接管会清除所有旧预览，须重新按 F。
+
+```bash
+cmake --build build --target g1_getup_mimic g1_getup_mimic_real -j2
+./g1 getup-mimic real eth0 --actuation drive_pd --reset-pose recovered
+./g1 getup-mimic real eth0 --actuation drive_pd --reset-pose recorded
+./g1 getup-mimic real eth0 --actuation drive_pd --reset-pose 3
+./g1 getup-mimic real eth0 --actuation drive_pd --reset-pose dwaq-reset
+```
+
+工控机必须使用匹配自身 CPU 的原生构建；安装包也需包含新增的复位 JSON。`model_test real` 同样接受该参数，并保持启动时所选专家。
+
+MuJoCo 加 `--suspension` 后，以直立初始姿态悬在空中。吊绳连接躯干上方的固定世界锚点，采用仅能拉、不能推的弹簧阻尼模型，通过 MuJoCo 点力作用于躯干，不锁定身体转动或直接覆盖位置。吊绳有预张力、拉力上限和 0.08 m/s 的收放速度。新增吊绳只影响该独立仿真，不改外部 MJCF 文件。
+
+```bash
+python3 apps/simulation/sim.py --getup-mimic \
+  --mjcf /path/to/g1.xml --actuation drive_pd \
+  --reset-pose recovered --suspension --interactive --follow --monitor 8767
+```
+
+将 `recovered` 换成 `recorded`、`3` 或 `dwaq-reset` 即测试相应目标。一种测试顺序：**9 → F → 等待 Holding → 按 6 逐次下放 → 按 P**。6/7 独立控制吊绳，不要求先按 9 或 F，也不改变关节控制阶段；可先下降再复位，或在复位、保持、策略运行时调整绳长。每按一次 6，目标绳长增加 **0.1 m**，以 0.08 m/s 缓慢放到该目标后停止；连续按键会累计目标长度，不会根据接地状态自动继续放绳或提前停止。终端显示当前绳长、目标长度及模拟拉力。P 不等待收放绳结束，不要求双脚接地或吊绳卸载，也不检查复位是否到位、是否静止；复位插值期间同样可以按 P。落地后吊绳仍可能分担较大比例重量，不能当作无吊绳站立结果。放绳使用 6、收绳使用 7，同时支持主键盘和数字小键盘；上电接管仍为 9。
+
+**7** 每按一次将目标绳长缩短 **0.1 m**，以 0.08 m/s 收到该目标后停止，连续按键累计，最短目标绳长为 0.1 m；放绳途中按 7 会从当前绳长开始收 0.1 m，收绳途中按 6 同样从当前绳长开始放 0.1 m。**空格**清零电机输出，但仿真吊绳仍保持连接，6/7 仍可操作；**R**仍重置场景，**N**仍切换场景。没有 `--suspension` 时沿用原倒地场景，同样可按 F 进行指定姿态复位，但需实际支撑条件允许。
+
+复位后的保持会持续发送固定关节目标和 PD 增益，6/7 不会撤掉保持命令。目前保持复用策略的 Kp/Kd，速度目标为零、力矩前馈为零。纯 PD 在持续负载下通常存在位置静差，`Holding` 仅表示目标插值结束并持续控制，不代表实测角已经到位；实测误差不会阻止 P 启动策略。该实现尚不能保证卸去吊绳承重后仍保持复位角度或全身平衡。
+
+离线验证不连接机器人：
+
+```bash
+python3 -m unittest discover -s apps/getup_mimic/tests -v
+python3 apps/simulation/sim.py --getup-mimic --mjcf /path/to/g1.xml \
+  --actuation drive_pd --reset-pose recovered --suspension --reset-test --headless
+python3 apps/simulation/sim.py --getup-mimic --mjcf /path/to/g1.xml \
+  --actuation drive_pd --reset-pose recorded --suspension --reset-test --headless
+```
+
+`--reset-test` 只验证悬空复位、保持和落地，不自动启动 ONNX 策略。该无界面测试会模拟逐次按 6，每步到位后等待接触与姿态稳定，再决定是否模拟下一次按键；交互模式完全由用户逐次按 6。使用含 MuJoCo/NumPy 的 Python 可运行全部测试；无这些依赖时，仅跳过吊绳物理单元测试。测试不能替代实机验收。
 
 ### `model_test` 起身专家
 

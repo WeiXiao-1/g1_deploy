@@ -3,6 +3,7 @@
 from contextlib import ExitStack, contextmanager, nullcontext, suppress
 import json
 import math
+from pathlib import Path
 from queue import Empty, SimpleQueue
 import subprocess
 import time
@@ -66,6 +67,10 @@ class PolicyStream:
         if self._request("reset").strip() != "ok":
             raise RuntimeError("C++ policy reset was not acknowledged")
 
+    def select_reset_pose(self, name):
+        if self._request("pose " + name).strip() != "ok":
+            raise RuntimeError("C++ reset pose selection was not acknowledged")
+
     def step(self, q, dq, quaternion, omega):
         reply = self._send_state("step", (q, dq, quaternion, omega))
         values = np.asarray(reply.split(), dtype=np.float64)
@@ -77,12 +82,14 @@ class PolicyStream:
         state = np.concatenate(observation)
         return self._request(command + " " + " ".join(map(str, state))).strip()
 
-    def check_entry(self, observation):
-        reply = self._send_state("check", observation)
+    def check_entry(self, observation, *, reset_pose=False):
+        reply = self._send_state("check-reset" if reset_pose else "check", observation)
         if reply == "ready":
             return None
         if reply == "unready":
             return "Wait for the robot to settle"
+        if reply.startswith("unready "):
+            return reply.removeprefix("unready ")
         if reply.startswith("fault "):
             return reply.removeprefix("fault ")
         raise RuntimeError(f"Unexpected hardware entry reply: {reply}")
@@ -93,7 +100,7 @@ class PolicyStream:
             return phase, payload
         values = np.asarray(payload.split(), dtype=np.float64)
         count = len(self.joint_names) * (3 if self.drive_pd else 1)
-        if (phase not in ("damping", "rising", "standing", "timeout")
+        if (phase not in ("damping", "rising", "standing", "timeout", "resetting", "holding")
                 or values.size != count or not np.isfinite(values).all()):
             raise RuntimeError("Invalid GetUpMimic hardware simulation output")
         return phase, values.reshape(3, -1) if self.drive_pd else values
@@ -103,7 +110,11 @@ class PolicyStream:
 
 
 @contextmanager
-def open_policy(project_root, config, hardware=False, expert=None, *, actuation=None):
+def open_policy(project_root, config, hardware=False, expert=None, *, actuation=None, inference_delay_ms=0.0):
+    if not math.isfinite(inference_delay_ms) or inference_delay_ms < 0:
+        raise ValueError("Inference delay must be finite and nonnegative")
+    if inference_delay_ms and not hardware:
+        raise ValueError("Inference delay requires hardware configuration")
     binary = project_root / "build/g1_getup_mimic"
     if not binary.is_file():
         raise FileNotFoundError(f"Missing {binary}. Build the g1_getup_mimic CMake target first")
@@ -113,6 +124,8 @@ def open_policy(project_root, config, hardware=False, expert=None, *, actuation=
         command.extend(("--expert", expert))
     if actuation is not None:
         command.extend(("--actuation", actuation))
+    if hardware and inference_delay_ms:
+        command.extend(("--inference-delay-ms", str(inference_delay_ms)))
     with subprocess.Popen(command, stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, encoding="ascii", bufsize=1) as process:
         try:
@@ -163,6 +176,7 @@ class GetUpSimulation:
         model.dof_damping[self.joint_dq] = 0
         self.effort_limit = np.asarray(settings["effort_limit"])[self.pose_columns]
         self.data = mj.MjData(model)
+        self.suspension = None
 
     def reset(self, pose):
         self.policy.reset()
@@ -171,6 +185,8 @@ class GetUpSimulation:
         self.data.qpos[self.root_quaternion] = pose["root_quaternion"]
         self.data.qpos[self.joint_q] = np.asarray(pose["joint_position"])[self.pose_columns]
         mj.mj_forward(self.model, self.data)
+        if self.suspension is not None:
+            self.suspension.reset(self.data)
 
     def observation(self):
         data = self.data
@@ -208,7 +224,11 @@ class GetUpSimulation:
     def apply_forces(self, torques):
         self.data.qfrc_applied.fill(0)
         self.data.qfrc_applied[self.joint_dq] = torques
+        if self.suspension is not None:
+            self.suspension.apply(self.data, self.model.opt.timestep)
         mj.mj_step(self.model, self.data)
+        if self.suspension is not None:
+            self.suspension.after_step(self.data, self.model.opt.timestep)
 
     def check_step(self, expected_time):
         data = self.data
@@ -268,13 +288,12 @@ class RecoverySession:
         return "Control enabled. Damping only (P to get up)"
 
     def begin(self):
-        if self.phase != "ready":
+        if self.phase not in ("ready", "reset-request", "resetting", "holding"):
             return None
-        if self.hardware:
-            reason = self.policy.check_entry(self.simulation.observation())
-            if reason:
-                return f"Get-up blocked. {reason}"
-        self.policy.reset()
+        # P is independent of reset tracking, motion and cable/ground contact.
+        # Preserve the active reset output for the existing policy-entry blend.
+        if self.phase not in ("resetting", "holding"):
+            self.policy.reset()
         self.phase = "running"
         self.started_at = self.simulation.data.time
         self.first_stable = self.failure = None
@@ -284,10 +303,25 @@ class RecoverySession:
 
     def stop(self):
         self.recovery = None
+        if self.hardware:
+            self.policy.reset()
         if self.phase == "fault":
             self.damping_until = self.simulation.data.time
         else:
             self.phase = "off"
+
+    def begin_reset(self):
+        if not self.hardware:
+            return "Pose reset requires --hardware-config"
+        if self.phase in ("off", "fault"):
+            return "Press 9 before pose reset; R/N resets a faulted scene"
+        reason = self.policy.check_entry(self.simulation.observation())
+        if reason:
+            return f"Reset blocked. {reason}"
+        self.recovery = None
+        self.failure = None
+        self.phase = "reset-request"
+        return "Resetting from current joint angles; then hold"
 
     def advance(self):
         if self.hardware:
@@ -311,8 +345,9 @@ class RecoverySession:
         now = sim.data.time
         torque = 0.0
         message = None
-        if self.phase in ("ready", "running", "standing"):
-            command = "damping" if self.phase == "ready" else "getup"
+        if self.phase in ("ready", "running", "standing", "reset-request", "resetting", "holding"):
+            command = ("damping" if self.phase == "ready" else "reset-pose" if self.phase == "reset-request"
+                       else "hold" if self.phase in ("resetting", "holding") else "getup")
             status, output = self.policy.motor_tick(command, sim.observation())
             if status == "fault":
                 self.failure = output
@@ -331,6 +366,10 @@ class RecoverySession:
                     self.phase = "standing"
                     self.first_stable = now - self.started_at
                     message = f"Standing after {self.first_stable:.2f} s"
+                elif status in ("resetting", "holding"):
+                    if status == "holding" and self.phase != "holding":
+                        message = "Reset target interpolation complete. Holding. 6 pays out 0.1 m per press; P starts policy from live state"
+                    self.phase = status
         if self.phase == "fault":
             # Approximate the short drive-side damping burst with the simulator's joint velocity.
             torque = -self.policy.stop_kd * sim.data.qvel[sim.joint_dq] if now < self.damping_until else 0.0
@@ -412,6 +451,64 @@ def run_hardware_episode(simulation, pose, viewer):
     return passed
 
 
+def run_reset_test(simulation, pose, reset_pose):
+    """Exercise the real C++ reset/hold path, then lower the cable; no policy."""
+    session = RecoverySession(simulation, pose)
+    period = session.period
+    for _ in range(round(8.0 / period)):
+        session.advance()
+        if simulation.policy.check_entry(simulation.observation()) is None:
+            break
+    message = session.take_over()
+    if session.phase != "ready":
+        raise RuntimeError(message or "Suspended takeover failed")
+    print(session.begin_reset(), flush=True)
+    for _ in range(round(30.0 / period)):
+        session.advance()
+        if session.failure:
+            raise RuntimeError(session.failure)
+        if session.phase == "holding":
+            break
+    if session.phase != "holding":
+        raise RuntimeError("Suspended pose reset did not finish")
+    config = json.loads((Path(__file__).resolve().parents[1] /
+                        "getup_mimic/config/g1_getup_mimic_reset.json").read_text())
+    mapping = {name: i for i, name in enumerate(config["joint_names"])}
+    goal = np.asarray(config["profiles"][reset_pose]["joint_position"])[
+        [mapping[name] for name in simulation.policy.joint_names]]
+    error = float(np.max(np.abs(simulation.data.qpos[simulation.joint_q] - goal)))
+    print(f"Reset interpolation complete {reset_pose}: maximum joint error {error:.4f} rad; "
+          f"{simulation.suspension.status()}", flush=True)
+    simulation.suspension.lower()
+    steps = 1
+    step_finished_at = None
+    for _ in range(round(18.0 / period)):
+        session.advance()
+        if session.failure:
+            raise RuntimeError(session.failure)
+        if (simulation.suspension.grounded(simulation.data) and simulation.suspension.motion == "lowered"
+                and simulation.policy.check_entry(simulation.observation(), reset_pose=True) is None):
+            error = float(np.max(np.abs(simulation.data.qpos[simulation.joint_q] - goal)))
+            print(f"PASS reset and landing: {reset_pose}; max joint error {error:.4f} rad; "
+                  f"{simulation.suspension.status()}", flush=True)
+            return 0
+        # This headless test explicitly requests another payout step; the interactive
+        # winch never decides to keep lowering based on contact state.
+        if simulation.suspension.motion == "lowered":
+            if step_finished_at is None:
+                step_finished_at = simulation.data.time
+            if (simulation.data.time - step_finished_at >= 1.0 and steps < 10
+                    and not simulation.suspension.grounded(simulation.data)):
+                simulation.suspension.lower()
+                step_finished_at = None
+                steps += 1
+    contacts = [(simulation.model.geom(c.geom1).name, simulation.model.geom(c.geom2).name)
+                for c in simulation.data.contact[:simulation.data.ncon]]
+    raise RuntimeError(f"Landing did not reach both feet bearing weight: "
+                       f"{simulation.suspension.status()}, pelvis={simulation.data.qpos[simulation.root_position]}, "
+                       f"contacts={contacts}")
+
+
 def open_viewer(stack, simulation, follow, key_callback=None):
     from mujoco import viewer as mj_viewer
 
@@ -437,7 +534,10 @@ def run_interactive(simulation, poses, viewer, keys, monitor=None, *, label="Get
     session = RecoverySession(simulation, poses[pose_index])
     scene_started = time.monotonic()
     tick = 0
-    instructions = ("9 Take over | P Get up", "Space Stop | R Reset scene | N Next pose")
+    last_rope_motion = None
+    last_grounded = False
+    instructions = ("9 Take over | F Reset joints | P Policy",
+                    "6 Pay out 0.1 m | 7 Reel in 0.1 m | Space Stop motors | R Reset scene | N Next scene")
     limp = "Limp (9 to take over)"
 
     def show(message):
@@ -487,10 +587,36 @@ def run_interactive(simulation, poses, viewer, keys, monitor=None, *, label="Get
                     show(message)
                 elif session.phase == "off":
                     show(limp)
+            elif key == glfw.KEY_F:
+                with viewer.lock():
+                    show(session.begin_reset())
+            elif key in (glfw.KEY_6, glfw.KEY_KP_6, glfw.KEY_7, glfw.KEY_KP_7) and simulation.suspension is not None:
+                # The winch is independent of joint takeover, reset and policy.
+                # Moving it must not change the motor controller's phase/targets.
+                with viewer.lock():
+                    if key in (glfw.KEY_6, glfw.KEY_KP_6):
+                        simulation.suspension.lower()
+                    else:
+                        simulation.suspension.raise_body()
+                action = "Paying out 0.1 m" if key in (glfw.KEY_6, glfw.KEY_KP_6) else "Reeling in 0.1 m"
+                show(f"{action}; {simulation.suspension.status()}")
 
         # Gravity and contact advance in every phase, including with zero motor torque.
         with viewer.lock():
             message = session.advance()
+            if simulation.suspension is not None:
+                simulation.suspension.draw(viewer, simulation.data)
+                motion = simulation.suspension.motion
+                grounded = simulation.suspension.grounded(simulation.data)
+                if grounded and not last_grounded and not session.failure and session.phase == "holding":
+                    message = (f"Both feet on floor; {simulation.suspension.status()}. "
+                               "P starts policy from live state")
+                elif motion == "lowered" and last_rope_motion != "lowered" and not session.failure:
+                    message = f"Payout target reached; {simulation.suspension.status()}. 6 adds another 0.1 m"
+                elif motion == "raised" and last_rope_motion == "raising" and not session.failure:
+                    message = f"Reel-in target reached; {simulation.suspension.status()}. 7 reels in another 0.1 m"
+                last_rope_motion = motion
+                last_grounded = grounded
             if monitor is not None:
                 phase = session.phase
                 if phase == "fault" and simulation.data.time < session.damping_until:
@@ -504,7 +630,8 @@ def run_interactive(simulation, poses, viewer, keys, monitor=None, *, label="Get
 
 
 def run(project_root, mjcf, kind, headless, follow, interactive=False, hardware=False, monitor_port=None,
-        *, expert=None, actuation=None):
+        *, expert=None, actuation=None, reset_pose="recovered", suspension=False, reset_test=False,
+        inference_delay_ms=0.0):
     if not mjcf.is_file():
         raise FileNotFoundError(f"MJCF file not found: {mjcf}")
     config = project_root / "apps/getup_mimic/config/g1_getup_mimic.json"
@@ -516,22 +643,37 @@ def run(project_root, mjcf, kind, headless, follow, interactive=False, hardware=
         kind = kind or profiles[expert]["pose"]
         label = f"model_test {expert}"
         print(label, flush=True)
+    label += f" | F reset: {reset_pose}"
     kind = kind or "all"
     settings_path = config.with_name("g1_getup_mimic_sim.json")
     settings = json.loads(settings_path.read_text())
     poses = [pose for pose in settings["poses"] if kind == "all" or pose["kind"] == kind]
+    if suspension:
+        data = json.loads(config.read_text())
+        poses = [dict(kind="suspended", row=0, root_position=[0., 0., 1.05], root_quaternion=[1., 0., 0., 0.],
+                      joint_position=data["default_joint_pos"])]
     if not poses:
         raise ValueError(f"No GetUpMimic presets for {kind}")
 
     passed = 0
     viewer = None
-    with open_policy(project_root, config, hardware, expert, actuation=actuation) as policy, ExitStack() as stack:
+    with open_policy(project_root, config, hardware, expert, actuation=actuation,
+                     inference_delay_ms=inference_delay_ms) as policy, ExitStack() as stack:
         simulation = GetUpSimulation(mjcf, settings, policy)
         if hardware:
+            policy.select_reset_pose(reset_pose)
+        if suspension:
+            from getup_mimic_suspension import TorsoSuspension
+            simulation.reset(poses[0])
+            simulation.suspension = TorsoSuspension(simulation.model, simulation.data)
+        if reset_test:
+            return run_reset_test(simulation, poses[0], reset_pose)
+        if hardware:
             mode = "drive_pd" if policy.drive_pd else "host_torque"
-            label = f"{label} · {mode}"
+            label = f"{label} · {mode} · inference delay {inference_delay_ms:g} ms"
             print(f"GetUpMimic MuJoCo hardware config | {mode} | policy {policy.period * 1000:g} ms"
-                  f" / control and physics {policy.control_period * 1000:g} ms", flush=True)
+                  f" / control and physics {policy.control_period * 1000:g} ms"
+                  f" | simulated inference delay {inference_delay_ms:g} ms", flush=True)
         if interactive:
             monitor = None
             if monitor_port is not None:

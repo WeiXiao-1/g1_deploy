@@ -79,6 +79,19 @@ inline bool ReadyToGetUp(const HardwareSettings& settings, const State& state) {
                        [&](float speed) { return std::abs(speed) <= settings.entry_joint_speed; });
 }
 
+inline std::string EntryMotionBlockReason(const HardwareSettings& settings, const State& state) {
+    if (GyroSpeed(state) > settings.entry_gyro_speed)
+        return "Pelvis angular speed=" + std::to_string(GyroSpeed(state)) +
+            " rad/s exceeds " + std::to_string(settings.entry_gyro_speed) + " rad/s";
+    for (int j = 0; j < kJointCount; ++j) {
+        if (std::abs(state.velocity[j]) > settings.entry_joint_speed)
+            return "Joint still moving: " + g1_joints::kDdsNames[j] +
+                " speed=" + std::to_string(std::abs(state.velocity[j])) +
+                " rad/s exceeds " + std::to_string(settings.entry_joint_speed) + " rad/s";
+    }
+    return {};
+}
+
 inline bool Standing(const State& state) {
     // Use the available pelvis attitude and knee states in the absence of root-height ground truth.
     return -ProjectedGravity(state.pelvis_quaternion)[2] > .9f && GyroSpeed(state) < .6f &&
